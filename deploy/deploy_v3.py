@@ -36,6 +36,10 @@ pol = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Ac
        "Resource": f"arn:aws:secretsmanager:{REGION}:{ACCT}:secret:clinicflow/azure-openai-key*"}]})
 for role in ("clinicflow-agentcore-role", "clinicflow-lambda-role"):
     iam.put_role_policy(RoleName=role, PolicyName="clinicflow-azure-secret", PolicyDocument=pol)
+iam.put_role_policy(RoleName="clinicflow-lambda-role", PolicyName="clinicflow-transcribe", PolicyDocument=json.dumps({
+    "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Resource": "*",
+    "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"]}]}))
+print("   transcribe policy attached to clinicflow-lambda-role")
 try:
     boto3.client("secretsmanager").describe_secret(SecretId="clinicflow/azure-openai-key")
     print("   secret clinicflow/azure-openai-key found")
