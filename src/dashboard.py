@@ -98,7 +98,7 @@ def nudge_waiting(q: str) -> list:
             try:
                 c.wa_buttons(t["phone"], f"🚶 Time to leave, {t['name']}! Token {t['label']}: {ahead} ahead of you, "
                                          f"~{eta} min. You're ~{travel} min away{how}.",
-                             [("b_here", "📍 I'm here"), ("b_late", "⏰ Running late"), ("b_status", "🔄 Refresh")])
+                             [("b_here", "✅ I've arrived"), ("b_late", "⏰ Running late"), ("b_status", "🔄 Refresh")])
             except Exception:
                 c.log.exception("nudge failed")
             c.set_token(t, nudged=True, nudged_at=c.iso_now(), nudge_travel_min=travel)
@@ -130,7 +130,7 @@ def call_next(q: str, skip: bool = False) -> dict:
             room = "laser room" if q == "LASER" else "doctor's cabin"
             try:
                 c.wa_buttons(nxt["phone"], f"✅ It's your turn, {nxt['name']}! Token {nxt['label']}. "
-                                           f"Please come to the {room}.", [("b_here", "📍 I'm here")])
+                                           f"Please come to the {room}.", [("b_here", "✅ I've arrived")])
             except Exception:
                 c.log.exception("turn message failed")
         called = nxt["label"]

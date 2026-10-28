@@ -19,8 +19,9 @@ _ac = None
 # interactive ids -> what the patient "said"
 INTENTS = {
     "m_opd": "token opd", "m_laser": "token laser", "m_status": "status", "m_pkg": "package",
-    "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here",
+    "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
     "b_status": "status", "b_late": "running late", "b_cancel": "cancel", "b_here": "I'm here",
+    "b_loc": "__share_location__",
     "book_pkg": "book session", "later": "remind me later",
 }
 
@@ -29,8 +30,11 @@ MENU_ROWS = [
     ("m_laser", "Laser / procedure", "Laser, peel, PRP: book today's slot"),
     ("m_status", "My wait time", "Live position and ETA"),
     ("m_pkg", "My packages", "Sessions done, next due, book next"),
+    ("m_loc", "📍 Share my location", "Live-traffic drive time: know exactly when to leave"),
     ("m_cancel", "Cancel my token", "Free your slot for someone else"),
 ]
+LOC_ASK = ("📍 Tap *Send location* below. ClinicFlow checks live traffic with Amazon Location Service "
+           "and tells you the exact minute to leave, so you wait at home, not in the clinic.")
 
 
 def ask_agent(phone: str, text: str) -> str:
@@ -131,19 +135,21 @@ def send_with_ui(phone: str, reply: str, pid: str, asked: str = ""):
     """Wrap the reply in interactive UI based on the patient's state."""
     tok = c.active_token(phone)
     prof = c.patient(phone)
+    has_gps = prof.get("lat") is not None
     try:
         if tok and tok["status"] == "in_consult":
             c.wa_text(phone, reply, pid)
         elif tok:
             if tok.get("arrived"):
                 buttons = [("b_status", "🔄 Refresh wait"), ("b_cancel", "❌ Cancel")]
+            elif not has_gps:
+                buttons = [("b_status", "🔄 Refresh wait"), ("b_loc", "📍 Share location"), ("b_late", "⏰ Running late")]
             else:
-                buttons = [("b_status", "🔄 Refresh wait"), ("b_late", "⏰ Running late"), ("b_here", "📍 I'm here")]
+                buttons = [("b_status", "🔄 Refresh wait"), ("b_late", "⏰ Running late"), ("b_here", "✅ I've arrived")]
             c.wa_buttons(phone, reply, buttons, pid)
-            if not prof.get("travel_min") and not prof.get("loc_asked"):
+            if not has_gps and not tok.get("arrived") and prof.get("loc_asked") != c.today():
                 c.upsert_patient(phone, loc_asked=c.today())
-                c.wa_location_request(phone, "Tap below to share your location once. ClinicFlow uses Amazon Location "
-                                             "Service to work out your drive time and tells you exactly when to leave.", pid)
+                c.wa_location_request(phone, LOC_ASK, pid)
         else:
             c.wa_list(phone, reply, "Menu", MENU_ROWS, pid)
     except Exception:  # interactive failed (e.g. body too long) -> plain text
@@ -170,6 +176,9 @@ def lambda_handler(event, context):
                     text = text_of(msg)
                     if not text:
                         reply = "Sorry, I can read text, buttons, photos and locations for now 🙏"
+                    elif text == "__share_location__" or text.strip().lower() in ("location", "share location", "my location", "📍"):
+                        c.wa_location_request(phone, LOC_ASK, pid)
+                        continue
                     elif PHASE1_ECHO:
                         reply = f"ClinicFlow is live ✅\nYou said: {text}"
                     else:
