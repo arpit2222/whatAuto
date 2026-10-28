@@ -15,12 +15,15 @@ flowchart LR
   FB["Deterministic<br/>fallback router"]
   DDB[("Amazon DynamoDB<br/>clinic · queue · patients · packages")]
   S3[("Amazon S3<br/>patient photos")]
-  DASH["λ clinicflow-dashboard<br/>Function URL<br/>Call next · leave-now nudges"]
+  LOC["Amazon Location Service<br/>drive time → leave-now"]
+  SUM["Doctor daily summary<br/>20:30 IST"]
+  DASH["λ clinicflow-dashboard<br/>OPD + Laser queues · impact metrics<br/>Call next · no-show · walk-in"]
   REM["λ clinicflow-reminders"]
   EB["Amazon EventBridge<br/>daily 10:00 IST"]
 
   P -- message / photo --> EUM --> SNS --> GW
   GW -- GetWhatsAppMessageMedia --> S3
+  GW -- shared location --> LOC
   GW -- InvokeAgentRuntime --> RT
   RT <--> MEM
   RT -- tools --> DDB
@@ -31,6 +34,7 @@ flowchart LR
   R --> DASH --> DDB
   DASH -- your turn / leave now --> EUM
   EB --> REM --> DDB
+  EB --> SUM --> SES
   REM -- session_reminder template --> EUM
   REM --> SES
   SES -- email --> P
