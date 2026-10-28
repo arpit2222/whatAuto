@@ -35,7 +35,7 @@ back. Everyone already uses WhatsApp; nobody wants another app.
 |---|---|
 | Interactive WhatsApp: list **Menu**, reply buttons (🔄 Refresh wait · ⏰ Running late · 📍 I'm here · ❌ Cancel) | **Two parallel queues**: OPD (doctor, ~6 min) and Laser/procedure (~20 min), tokens `O7` / `L2` |
 | Take a token in one message, in English, Hindi or Hinglish | Per-queue **✅ Call next**, **⏭️ No-show**, **Finish**, **+ Walk-in** (patients without WhatsApp) |
-| **📍 Share location → Amazon Location Service** computes real drive time → **"Leave now"** nudge at the right moment | Live board: ETA, ✓ arrived, 🚶 nudged, ⏰ late, "14 min away · AWS Location", 📦 package, 📷 photo previews |
+| **📍 Live-traffic leave-now**: patient shares location → **Amazon Location Service** drive time with current traffic, **re-checked on every queue move**; ClinicFlow asks for a fresh location as their turn nears → **"Leave now"** at the exact minute | Live board: ETA, ✓ arrived, 🚶 nudged, ⏰ late, "14 min away · AWS Location", 📦 package, 📷 photo previews |
 | **Running late** moves the token back 2 places instead of losing it; **I'm here** checks in | **Impact tiles**: waiting-room minutes saved, reception calls avoided, nudges, no-shows, package sessions booked |
 | Send photos: stored privately in S3, previewed by the doctor on the board | **📧 Daily doctor summary** via Amazon SES (20:30 IST, or on demand) incl. packages due |
 | Package status & one-tap booking of the next session (laser queue) | Package sessions auto-counted + next due date scheduled; daily reminders (WhatsApp template + email) |
@@ -90,7 +90,7 @@ See `docs/architecture.png` for the diagram.
 | Amazon DynamoDB | Single-table data model (clinic, daily queue, patients, packages) |
 | Amazon S3 | Private storage for patient photos |
 | Amazon EventBridge | Daily package reminders (10:00 IST) + doctor summary (20:30 IST) |
-| **Amazon Location Service** (Routes) | Drive time from the patient's shared WhatsApp location to the clinic for leave-now timing |
+| **Amazon Location Service** (Routes) | Traffic-aware drive time (`CalculateRoutes`, DepartNow) from the patient's shared WhatsApp location, re-computed on every queue move |
 | AWS IAM, Amazon CloudWatch, AWS Budgets | Least-privilege roles, logs, cost alerts |
 
 ### Where AWS CDS is called in code
