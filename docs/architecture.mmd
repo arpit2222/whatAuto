@@ -1,0 +1,36 @@
+flowchart LR
+  P["📱 Patient<br/>WhatsApp"]
+  R["🧑‍💼 Receptionist<br/>browser"]
+  subgraph CDS["AWS Communication Developer Services"]
+    EUM["AWS End User Messaging<br/>Social (WhatsApp)"]
+    SES["Amazon SES<br/>confirmations · summaries"]
+  end
+  SNS["Amazon SNS<br/>inbound events"]
+  GW["λ clinicflow-whatsapp-handler<br/>parse · media · route"]
+  subgraph AC["Amazon Bedrock AgentCore"]
+    RT["AgentCore Runtime<br/>clinicflow_agent<br/>(session per patient)"]
+    MEM["AgentCore Memory<br/>(code-ready)"]
+  end
+  BR["Amazon Bedrock<br/>Converse + tool use<br/>Amazon Nova"]
+  FB["Deterministic<br/>fallback router"]
+  DDB[("Amazon DynamoDB<br/>clinic · queue · patients · packages")]
+  S3[("Amazon S3<br/>patient photos")]
+  DASH["λ clinicflow-dashboard<br/>Function URL<br/>Call next · leave-now nudges"]
+  REM["λ clinicflow-reminders"]
+  EB["Amazon EventBridge<br/>daily 10:00 IST"]
+
+  P -- message / photo --> EUM --> SNS --> GW
+  GW -- GetWhatsAppMessageMedia --> S3
+  GW -- InvokeAgentRuntime --> RT
+  RT <--> MEM
+  RT -- tools --> DDB
+  RT --> BR
+  RT -. if unavailable .-> FB
+  RT -- email --> SES
+  GW -- SendWhatsAppMessage --> EUM -- reply --> P
+  R --> DASH --> DDB
+  DASH -- your turn / leave now --> EUM
+  EB --> REM --> DDB
+  REM -- session_reminder template --> EUM
+  REM --> SES
+  SES -- email --> P
