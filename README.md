@@ -14,9 +14,9 @@ Communication Developer Services, with the agent hosted on **Amazon Bedrock Agen
 | What | How |
 |---|---|
 | **WhatsApp the clinic bot** | Send `hi` to **+91 72178 11862** (display name currently shows *Secureyourhealthdata*: Meta display-name review is pending) |
-| Suggested script | `hi` → `token` → your name → `15 min` → `status` → send any photo → `package` → `cancel` |
-| **Receptionist dashboard** | Link + key are in the Devpost *Testing instructions* field (kept out of the public repo) |
-| See the queue move | Press **✅ Call next patient**: you get *"It's your turn"* on WhatsApp, and patients whose wait ≤ travel time + 5 min get *"Time to leave"* |
+| Suggested script | `hi` → tap **Menu → Doctor consultation** → your name → tap **📍 Send location** → **🔄 Refresh wait** → send a photo → **⏰ Running late** → **📍 I'm here** → `laser` / `package` |
+| **Receptionist dashboard** | Link + key are in the Devpost submission (judges-only field), kept out of the public repo |
+| See the queue move | Press **✅ Call next** on the OPD or Laser queue: you get *"It's your turn"* on WhatsApp, and patients whose wait ≤ travel time + 5 min get *"Time to leave"* with buttons. Try **No-show**, **+ Walk-in**, **📧 Send doctor summary**. |
 
 Hindi / Hinglish works too (*"token chahiye"*, *"kitna time lagega"*).
 
@@ -24,7 +24,7 @@ Hindi / Hinglish works too (*"token chahiye"*, *"kitna time lagega"*).
 
 ## The problem
 
-India's ~1.5 lakh small dermatology, dental and physio clinics run walk-in queues on paper tokens and phone
+Lakhs of small dermatology, dental and physio clinics in India run walk-in queues on paper tokens and phone
 calls. Patients wait 1–2 hours in crowded waiting rooms, receptionists spend most of their day answering
 *"how long?"* calls, and multi-session packages (laser, peels, PRP) leak revenue when patients forget to come
 back. Everyone already uses WhatsApp; nobody wants another app.
@@ -33,11 +33,13 @@ back. Everyone already uses WhatsApp; nobody wants another app.
 
 | For patients (WhatsApp) | For the clinic |
 |---|---|
-| Take a token in one message, in English, Hindi or Hinglish | One-button queue: **Call next patient** |
-| Live position + ETA (`status`) | Live board: tokens, ETA, nudged ✓, photos 📷 |
-| **"Leave now"** nudge based on *their* travel time, so no more 2-hour waits in the clinic | Package sessions auto-counted and next due date scheduled |
-| Send photos: stored privately, attached to the visit for the doctor | Daily package-due reminders (WhatsApp template + email) |
-| Package status & one-tap booking of the next session | Booking confirmations & visit summaries by email (SES) |
+| Interactive WhatsApp: list **Menu**, reply buttons (🔄 Refresh wait · ⏰ Running late · 📍 I'm here · ❌ Cancel) | **Two parallel queues**: OPD (doctor, ~6 min) and Laser/procedure (~20 min), tokens `O7` / `L2` |
+| Take a token in one message, in English, Hindi or Hinglish | Per-queue **✅ Call next**, **⏭️ No-show**, **Finish**, **+ Walk-in** (patients without WhatsApp) |
+| **📍 Share location → Amazon Location Service** computes real drive time → **"Leave now"** nudge at the right moment | Live board: ETA, ✓ arrived, 🚶 nudged, ⏰ late, "14 min away · AWS Location", 📦 package, 📷 photo previews |
+| **Running late** moves the token back 2 places instead of losing it; **I'm here** checks in | **Impact tiles**: waiting-room minutes saved, reception calls avoided, nudges, no-shows, package sessions booked |
+| Send photos: stored privately in S3, previewed by the doctor on the board | **📧 Daily doctor summary** via Amazon SES (20:30 IST, or on demand) incl. packages due |
+| Package status & one-tap booking of the next session (laser queue) | Package sessions auto-counted + next due date scheduled; daily reminders (WhatsApp template + email) |
+| Emails with a **"Check my queue on WhatsApp"** button (SES → WhatsApp handoff) | **↺ Reset today (demo)** for clean demos |
 
 ---
 
@@ -53,9 +55,9 @@ back. Everyone already uses WhatsApp; nobody wants another app.
       │                                              ▼
       │                               Amazon Bedrock AgentCore Runtime: clinicflow_agent
       │                               ├─ Bedrock Converse + tool use (Amazon Nova)
-      │                               ├─ tools: book_token · queue_status · cancel_token ·
-      │                               │         my_packages · book_package_session ·
-      │                               │         set_travel_time · save_email
+      │                               ├─ tools: book_token(OPD|LASER) · queue_status · running_late ·
+      │                               │         im_here · cancel_token · my_packages ·
+      │                               │         book_package_session · set_travel_time · save_email
       │                               └─ AgentCore Memory (code-ready; history in DynamoDB today)
       │                                              │
       │                       ┌──────────────────────┼─────────────────────┐
@@ -86,7 +88,8 @@ See `docs/architecture.png` for the diagram.
 | Amazon SNS | Event destination for inbound WhatsApp events |
 | Amazon DynamoDB | Single-table data model (clinic, daily queue, patients, packages) |
 | Amazon S3 | Private storage for patient photos |
-| Amazon EventBridge | Daily reminder schedule |
+| Amazon EventBridge | Daily package reminders (10:00 IST) + doctor summary (20:30 IST) |
+| **Amazon Location Service** (Routes) | Drive time from the patient's shared WhatsApp location to the clinic for leave-now timing |
 | AWS IAM, Amazon CloudWatch, AWS Budgets | Least-privilege roles, logs, cost alerts |
 
 ### Where AWS CDS is called in code
@@ -117,9 +120,10 @@ consistent and patients always get an answer. Each AgentCore response reports wh
 | pk | sk | attributes |
 |---|---|---|
 | `CLINIC#<id>` | `META` | name, address, hours, avg_consult_min, services |
-| `CLINIC#<id>#DAY#<date>` | `COUNTER` | last_token, now_serving |
-| `CLINIC#<id>#DAY#<date>` | `TOKEN#<nnn>` | phone, name, service, status, nudged, photos, package |
-| `PATIENT#<phone>` | `PROFILE` | name, email, travel_min |
+| `CLINIC#<id>#DAY#<date>` | `COUNTER#<OPD\|LASER>` | last_token, now_serving, now_serving_label |
+| `CLINIC#<id>#DAY#<date>` | `STATS` | status_checks, nudges, no_shows, late, photos, package_bookings, locations |
+| `CLINIC#<id>#DAY#<date>` | `TOKEN#<Q>#<nnn>` | queue, label (O7/L2), pos, phone, name, service, status, nudged, arrived, late, photos, package, created/nudged_at/called_at/arrived_at/done_at |
+| `PATIENT#<phone>` | `PROFILE` | name, email, travel_min, travel_source (amazon-location / patient), lat, lon |
 | `PATIENT#<phone>` | `PACKAGE#<name>` | total, used, interval_days, next_due |
 
 ---
@@ -134,6 +138,7 @@ an SNS topic set as its event destination, and Bedrock model access.
 bash deploy/deploy_phase1.sh           # SNS subscription + WhatsApp Lambda (echo test)
 SES_FROM=you@yourdomain.com bash deploy/deploy_phase2.sh   # DynamoDB, S3, IAM, 3 Lambdas, dashboard URL, schedule, seed data
 python3 deploy/deploy_agentcore.py     # AgentCore Memory + Runtime, wires the Lambda to it
+python3 deploy/deploy_v2.py            # OPD/Laser queues, Amazon Location, impact metrics, doctor summary schedule
 ```
 
 Edit `PHONE_ID` in `deploy/deploy_phase2.sh` to your `phone-number-id-…`. The deploy prints the dashboard URL.
