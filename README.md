@@ -54,7 +54,7 @@ back. Everyone already uses WhatsApp; nobody wants another app.
       │ SendWhatsAppMessage                          │ InvokeAgentRuntime (session per patient)
       │                                              ▼
       │                               Amazon Bedrock AgentCore Runtime: clinicflow_agent
-      │                               ├─ Bedrock Converse + tool use (Amazon Nova)
+      │                               ├─ model chain: Bedrock (Nova) → Azure OpenAI gpt-6-astra → router
       │                               ├─ tools: book_token(OPD|LASER) · queue_status · running_late ·
       │                               │         im_here · cancel_token · my_packages ·
       │                               │         book_package_session · set_travel_time · save_email
@@ -83,7 +83,8 @@ See `docs/architecture.png` for the diagram.
 | **Amazon SES** (sesv2) | Booking confirmations, visit summaries, package reminders |
 | **Amazon Bedrock AgentCore Runtime** | Hosts the ClinicFlow agent; one isolated session per patient |
 | Amazon Bedrock AgentCore Memory | Implemented (`common.load_conv/save_turn`, enabled by `MEMORY_ID`); provisioning failed on our new account ("Failed to provision Vector Store"), so conversation history currently uses DynamoDB |
-| **Amazon Bedrock** (Converse API, tool use, Amazon Nova) | Reasoning + tool calling |
+| **Amazon Bedrock** (Converse API, tool use, Amazon Nova) | Primary model (pending account quota) |
+| Azure OpenAI gpt-6-astra (Microsoft Foundry) | Live model today: Responses API + function calling; key in **AWS Secrets Manager** |
 | AWS Lambda | WhatsApp gateway, receptionist dashboard, reminders |
 | Amazon SNS | Event destination for inbound WhatsApp events |
 | Amazon DynamoDB | Single-table data model (clinic, daily queue, patients, packages) |
@@ -107,11 +108,11 @@ switches for 10 minutes to a **deterministic intent router** that calls the *sam
 consistent and patients always get an answer. Each AgentCore response reports which engine answered
 (`bedrock:<model>` or `fallback-router`) in CloudWatch logs.
 
-> **Honest status at submission time:** the agent is deployed and serving live traffic on **AgentCore
-> Runtime**. Our new AWS account's Bedrock model quota and AgentCore Memory are still pending account
-> verification with AWS Support, so the live bot currently answers through the fallback router (same tools,
-> same data). The Bedrock tool-use path and Memory integration are implemented and switch on automatically
-> once the account is verified. No redeploy needed.
+> **Honest status at submission time:** the agent runs on **Amazon Bedrock AgentCore Runtime** and reasons with
+> **Azure OpenAI gpt-6-astra (Microsoft Foundry, Responses API + function calling)** as its live model. Our new AWS
+> partner account's Bedrock daily token quota is still pending AWS account verification. The Amazon Bedrock (Nova)
+> path is implemented first in the chain and takes over automatically once the quota is granted, with no redeploy.
+> Model chain: **Bedrock → Azure OpenAI → deterministic router**. All three drive the same 9 tools.
 
 ---
 
