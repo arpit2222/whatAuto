@@ -277,6 +277,22 @@ def travel_minutes(lat: float, lon: float, cl: dict | None = None) -> tuple[int,
     return max(3, round(km * 1.3 / 25 * 60)), "estimate"   # 1.3x road factor, 25 km/h city traffic
 
 
+def refresh_travel(phone: str, prof: dict | None = None, max_age_min: float = 3) -> tuple[int | None, str, float | None]:
+    """Traffic-aware drive time from the patient's last shared location.
+    Re-queries Amazon Location Service (DepartNow = current traffic) if the estimate is older than max_age_min.
+    Returns (minutes, source, location_age_min)."""
+    prof = prof if prof is not None else patient(phone)
+    loc_age = minutes_between(prof.get("loc_at"), iso_now()) if prof.get("loc_at") else None
+    if prof.get("lat") is None or prof.get("lon") is None:
+        return (int(prof["travel_min"]) if prof.get("travel_min") else None), prof.get("travel_source", "patient"), None
+    est_age = minutes_between(prof.get("travel_at"), iso_now()) if prof.get("travel_at") else None
+    if est_age is not None and est_age < max_age_min:
+        return int(prof["travel_min"]), prof.get("travel_source", "amazon-location"), loc_age
+    minutes, source = travel_minutes(float(prof["lat"]), float(prof["lon"]))
+    upsert_patient(phone, travel_min=minutes, travel_source=source, travel_at=iso_now())
+    return minutes, source, loc_age
+
+
 # ---------------------------------------------------------------- WhatsApp UI helpers
 def wa_list(to: str, text: str, button: str, rows: list[tuple[str, str, str]], phone_id: str | None = None):
     """Interactive list: rows = [(id, title<=24, description<=72)]."""

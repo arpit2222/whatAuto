@@ -186,7 +186,7 @@ def run_tool(phone: str, name: str, args: dict) -> dict:
             c.bump("package_bookings")
         return {"booked": True, "package": pname, "session_number": pk["used"] + 1, **res}
     if name == "set_travel_time":
-        c.upsert_patient(phone, travel_min=int(args["minutes"]), travel_source="patient")
+        c.upsert_patient(phone, travel_min=int(args["minutes"]), travel_source="patient", travel_at=c.iso_now())
         return {"saved": True, "travel_min": int(args["minutes"])}
     if name == "save_email":
         c.upsert_patient(phone, email=args["email"].strip())

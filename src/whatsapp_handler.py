@@ -107,18 +107,24 @@ def handle_location(msg: dict, phone: str) -> str:
     loc = msg.get("location") or {}
     lat, lon = float(loc["latitude"]), float(loc["longitude"])
     minutes, source = c.travel_minutes(lat, lon)
-    c.upsert_patient(phone, travel_min=minutes, travel_source=source, lat=lat, lon=lon, pending="none")
+    now = c.iso_now()
+    c.upsert_patient(phone, travel_min=minutes, travel_source=source, lat=lat, lon=lon,
+                     loc_at=now, travel_at=now, pending="none")
     c.bump("locations")
-    how = "by car (Amazon Location Service)" if source == "amazon-location" else "by road (estimate)"
+    how = "by car with live traffic (Amazon Location Service)" if source == "amazon-location" else "by road (estimate)"
     tok = c.active_token(phone)
     if tok and tok["status"] == "waiting":
         ahead, eta = c.eta_minutes(tok)
         if eta <= minutes + 5:
+            if not tok.get("nudged"):
+                c.set_token(tok, nudged=True, nudged_at=now)
+                c.bump("nudges")
             return (f"📍 You're ~{minutes} min away {how}. Your wait is ~{eta} min, so "
                     f"*please leave now* 🚶 for token {tok['label']}.")
         return (f"📍 You're ~{minutes} min away {how}. Token {tok['label']} has ~{eta} min to go. "
-                f"Relax at home, and I'll ping you about {eta - minutes - 5} min from now when it's time to leave.")
-    return f"📍 Saved: you're ~{minutes} min away {how}. I'll use this to tell you when to leave."
+                f"Relax where you are. I'll re-check traffic as the queue moves and ping you when it's time to leave "
+                f"(about {max(1, eta - minutes - 5)} min from now).")
+    return f"📍 Saved: you're ~{minutes} min away {how}. I'll use this to tell you exactly when to leave."
 
 
 def send_with_ui(phone: str, reply: str, pid: str, asked: str = ""):

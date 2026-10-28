@@ -80,25 +80,39 @@ def finish_current(q: str, status: str = "done"):
 
 
 def nudge_waiting(q: str) -> list:
-    """Leave-now nudges: if remaining wait <= travel time + 5 min buffer, ping once."""
+    """Leave-now engine, run on every queue move.
+    1. Re-compute each waiting patient's drive time from their last location with live traffic (Amazon Location).
+    2. remaining wait <= drive time + 5 min  -> "Time to leave" (once).
+    3. about two patients before that point and location older than 30 min -> ask for a fresh location."""
     sent = []
+    svc = int(c.queue_cfg(q).get("service_min", 10))
     for t in c.waiting(q=q):
         if t.get("nudged") or t.get("arrived") or not _is_wa(t["phone"]):
             continue
         ahead, eta = c.eta_minutes(t)
         prof = c.patient(t["phone"])
-        travel = int(prof.get("travel_min", 15))
+        travel, source, loc_age = c.refresh_travel(t["phone"], prof)
+        travel = travel if travel is not None else 15
         if eta <= travel + 5:
-            src = " (Amazon Location)" if prof.get("travel_source") == "amazon-location" else ""
+            how = " with live traffic (Amazon Location)" if source == "amazon-location" else ""
             try:
                 c.wa_buttons(t["phone"], f"🚶 Time to leave, {t['name']}! Token {t['label']}: {ahead} ahead of you, "
-                                         f"~{eta} min. You're ~{travel} min away{src}.",
+                                         f"~{eta} min. You're ~{travel} min away{how}.",
                              [("b_here", "📍 I'm here"), ("b_late", "⏰ Running late"), ("b_status", "🔄 Refresh")])
             except Exception:
                 c.log.exception("nudge failed")
-            c.set_token(t, nudged=True, nudged_at=c.iso_now())
+            c.set_token(t, nudged=True, nudged_at=c.iso_now(), nudge_travel_min=travel)
             c.bump("nudges")
             sent.append(t["label"])
+        elif eta <= travel + 5 + 2 * svc and not t.get("loc_refresh_asked") and (loc_age is None or loc_age > 30):
+            try:
+                c.wa_location_request(t["phone"], f"⏳ {t['name']}, token {t['label']} is getting close ({ahead} ahead, "
+                                                  f"~{eta} min). Tap below to share where you are *now*. I'll check live "
+                                                  "traffic and tell you the exact minute to leave.")
+                c.set_token(t, loc_refresh_asked=True)
+                c.bump("location_requests")
+            except Exception:
+                c.log.exception("location request failed")
     return sent
 
 
@@ -150,6 +164,7 @@ def metrics(toks: list, st: dict) -> dict:
         "photos": int(st.get("photos", 0)),
         "package_bookings": int(st.get("package_bookings", 0)),
         "locations": int(st.get("locations", 0)),
+        "location_requests": int(st.get("location_requests", 0)),
         "bookings": int(st.get("bookings", 0)),
         "walkins": int(st.get("walkins", 0)),
     }
@@ -172,6 +187,9 @@ def state() -> dict:
                 prof = c.patient(t["phone"]) if _is_wa(t["phone"]) else {}
                 row["travel_min"] = prof.get("travel_min")
                 row["travel_source"] = prof.get("travel_source")
+                row["travel_age_min"] = round(c.minutes_between(prof.get("travel_at"), c.iso_now()) or 0) \
+                    if prof.get("travel_at") else None
+                row["loc_refresh_asked"] = t.get("loc_refresh_asked", False)
             rows.append(row)
         queues[q] = {"label": cfg["label"], "service_min": cfg["service_min"],
                      "now_serving": c.counter(q).get("now_serving_label", ""), "tokens": rows}
@@ -292,7 +310,7 @@ qs.innerHTML=Object.entries(d.queues).map(([q,Q])=>`<div class=q><div class=qh><
 <table><thead><tr><th>Token</th><th>Patient</th><th>Status</th><th>ETA</th><th>Signals</th><th>📷</th></tr></thead><tbody>
 ${Q.tokens.length?Q.tokens.map(t=>`<tr><td><b>${t.label}</b></td><td>${esc(t.name)}<br><small>${esc(t.service)}</small><br><small style=color:#99a>${t.phone}</small></td>
 <td class=${t.status}>${t.status.replace('_',' ')}</td><td>${t.eta_min!=null?t.eta_min+' min<br><small>'+t.people_ahead+' ahead</small>':''}</td>
-<td>${t.arrived?'<span class="pill ok">✓ arrived</span>':''}${t.nudged?'<span class=pill>🚶 nudged</span>':''}${t.late?'<span class="pill late">⏰ late</span>':''}${t.travel_min?`<span class="pill loc">${t.travel_min} min away${t.travel_source=='amazon-location'?' · AWS Location':''}</span>`:''}${t.package?'<span class=pill>📦 '+esc(t.package)+'</span>':''}</td>
+<td>${t.arrived?'<span class="pill ok">✓ arrived</span>':''}${t.nudged?'<span class=pill>🚶 nudged</span>':''}${t.late?'<span class="pill late">⏰ late</span>':''}${t.travel_min?`<span class="pill loc">${t.travel_min} min away${t.travel_source=='amazon-location'?' · live traffic'+(t.travel_age_min!=null?' · '+(t.travel_age_min<1?'just now':t.travel_age_min+'m ago'):''):''}</span>`:''}${t.loc_refresh_asked?'<span class=pill>📍 asked for location</span>':''}${t.package?'<span class=pill>📦 '+esc(t.package)+'</span>':''}</td>
 <td class=ph>${(t.photos||[]).map(u=>`<a href="${u}" target=_blank><img src="${u}"></a>`).join('')||(t.photo_count||'')}</td></tr>`).join(''):'<tr><td colspan=6 style="color:#99a;padding:16px">No tokens yet today</td></tr>'}
 </tbody></table></div>`).join('')}
 async function act(a,q){const r=await fetch(`api/${a}?key=${K}&q=${q}`,{method:'POST'});const d=await r.json();
