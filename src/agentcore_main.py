@@ -40,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             phone, text = str(req["phone"]), str(req["text"])
             started = time.time()
             reply = agent.respond(phone, text)
-            engine = "fallback-router" if time.time() < agent._BEDROCK_DOWN_UNTIL else f"bedrock:{agent.MODEL_ID}"
+            engine = agent.LAST_ENGINE["name"]
             c.log.info("turn phone=..%s engine=%s ms=%d", phone[-4:], engine, (time.time() - started) * 1000)
             self._send(200, {"reply": reply, "engine": engine})
         except Exception as e:

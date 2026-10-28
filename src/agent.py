@@ -15,7 +15,28 @@ from botocore.config import Config
 import common as c
 
 MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-pro-v1:0")
-brt = boto3.client("bedrock-runtime", config=Config(retries={"max_attempts": 1}, read_timeout=20))
+BEDROCK_ROLE_ARN = os.environ.get("BEDROCK_ROLE_ARN", "")      # optional cross-account role for model calls
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
+_BR_CFG = Config(retries={"max_attempts": 1}, read_timeout=25)
+_brt_cache = {"client": None, "exp": 0.0}
+
+
+def _bedrock():
+    """Bedrock runtime client. If BEDROCK_ROLE_ARN is set, assume that role (e.g. in the partner's
+    production account where Bedrock is enabled) with short-lived STS credentials, refreshed hourly."""
+    if not BEDROCK_ROLE_ARN:
+        if _brt_cache["client"] is None:
+            _brt_cache["client"] = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION, config=_BR_CFG)
+        return _brt_cache["client"]
+    if _brt_cache["client"] is None or time.time() > _brt_cache["exp"]:
+        cr = boto3.client("sts").assume_role(RoleArn=BEDROCK_ROLE_ARN, RoleSessionName="clinicflow-agent",
+                                             DurationSeconds=3600)["Credentials"]
+        _brt_cache["client"] = boto3.client(
+            "bedrock-runtime", region_name=BEDROCK_REGION, config=_BR_CFG,
+            aws_access_key_id=cr["AccessKeyId"], aws_secret_access_key=cr["SecretAccessKey"],
+            aws_session_token=cr["SessionToken"])
+        _brt_cache["exp"] = time.time() + 3000
+    return _brt_cache["client"]
 _BEDROCK_DOWN_UNTIL = 0.0  # skip Bedrock for 10 min after an availability error
 
 SYSTEM = """You are ClinicFlow, the WhatsApp front desk for {name}, a skin & laser clinic in {address}.
@@ -216,7 +237,8 @@ def _fallback(phone: str, text: str) -> str:
         run_tool(phone, "set_travel_time", {"minutes": m})
         c.upsert_patient(phone, pending="none")
         return f"Got it – {m} min away. I'll ping you when it's time to leave 🚶"
-    if pending.startswith("name") and len(t) < 40 and not re.search(r"token|queue|status|cancel|package|menu|hi$|hello", t):
+    if pending.startswith("name") and len(t) < 40 and "?" not in t and \
+            not re.search(r"token|queue|status|cancel|package|menu|hi$|hello|kitna|kab|time|wait|late|here|laser|opd", t):
         c.upsert_patient(phone, name=text.strip().title(), pending="none")
         prof["name"] = text.strip().title()
         t = "token laser" if pending == "name:LASER" else "token opd"
@@ -266,23 +288,108 @@ def _fallback(phone: str, text: str) -> str:
             "Tap *Menu* below or just type what you need.")
 
 
-# ---------------------------------------------------------------- agent loop
-def respond(phone: str, user_text: str) -> str:
-    global _BEDROCK_DOWN_UNTIL
-    if time.time() < _BEDROCK_DOWN_UNTIL:
-        return fallback(phone, user_text)
+# ---------------------------------------------------------------- secondary model: Azure OpenAI (Foundry)
+AZURE_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")      # e.g. https://x.openai.azure.com/openai/v1
+AZURE_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
+AZURE_SECRET_ID = os.environ.get("AZURE_OPENAI_SECRET_ID", "clinicflow/azure-openai-key")
+_azure_key = {"v": None, "t": 0.0}
+LAST_ENGINE = {"name": "fallback-router"}
+
+
+def _azure_api_key() -> str:
+    if _azure_key["v"] is None or time.time() - _azure_key["t"] > 900:
+        sec = boto3.client("secretsmanager").get_secret_value(SecretId=AZURE_SECRET_ID)["SecretString"].strip()
+        if sec.startswith("{"):
+            sec = json.loads(sec).get("api_key", "")
+        _azure_key.update(v=sec, t=time.time())
+    return _azure_key["v"]
+
+
+def _azure_call(body: dict) -> dict:
+    """Azure OpenAI Responses API (gpt-6 supports function tools only on /v1/responses)."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(f"{AZURE_ENDPOINT}/responses", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "api-key": _azure_api_key()})
     try:
-        return _respond_llm(phone, user_text)
-    except Exception as e:
-        if e.__class__.__name__ in ("ThrottlingException", "AccessDeniedException", "ResourceNotFoundException",
-                                    "ValidationException", "ServiceUnavailableException", "ModelNotReadyException"):
-            _BEDROCK_DOWN_UNTIL = time.time() + 600
-            c.log.warning("Bedrock unavailable (%s) – using fallback router", e.__class__.__name__)
-            return fallback(phone, user_text)
+        with urllib.request.urlopen(req, timeout=40) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        c.log.error("Azure HTTP %s: %s", e.code, e.read().decode()[:500])
         raise
 
 
-def _respond_llm(phone: str, user_text: str) -> str:
+def _wa_markdown(t: str) -> str:
+    """Model markdown -> WhatsApp formatting (*bold*, no headings)."""
+    t = t.replace("**", "*").replace("__", "_")
+    return re.sub(r"^#+\s*", "", t, flags=re.M).strip()
+
+
+def _respond_azure(phone: str, user_text: str) -> str:
+    system, history = _system_and_history(phone)
+    tools = [{"type": "function", "name": t["name"], "description": t["description"], "parameters": t["schema"]}
+             for t in TOOLS]
+    base = {"model": AZURE_DEPLOYMENT, "tools": tools,
+            "reasoning": {"effort": os.environ.get("AZURE_REASONING_EFFORT", "low")}}
+    r = _azure_call({**base, "instructions": system,
+                     "input": [{"role": m["role"], "content": m["text"]} for m in history] +
+                              [{"role": "user", "content": user_text}]})
+    reply = ""
+    for _ in range(6):
+        calls = [o for o in r.get("output", []) if o.get("type") == "function_call"]
+        texts = [p_.get("text", "") for o in r.get("output", []) if o.get("type") == "message"
+                 for p_ in (o.get("content") or []) if p_.get("type") in ("output_text", "text")]
+        if not calls:
+            reply = "".join(texts).strip()
+            break
+        outs = []
+        for fc in calls:
+            try:
+                res = run_tool(phone, fc["name"], json.loads(fc.get("arguments") or "{}"))
+            except Exception as e:
+                c.log.exception("tool %s failed", fc.get("name"))
+                res = {"error": str(e)}
+            c.log.info("tool %s(%s) -> %s", fc.get("name"), fc.get("arguments"), res)
+            outs.append({"type": "function_call_output", "call_id": fc["call_id"], "output": json.dumps(res)})
+        r = _azure_call({**base, "previous_response_id": r["id"], "input": outs})
+    reply = _wa_markdown(reply) or "Sorry, I had trouble there. Please try again 🙏"
+    c.save_turn(phone, user_text, reply, history)
+    return reply
+
+
+# ---------------------------------------------------------------- agent loop
+_AZURE_DOWN_UNTIL = 0.0
+
+
+def respond(phone: str, user_text: str) -> str:
+    """Amazon Bedrock first; Azure OpenAI as secondary model; deterministic router as last resort.
+    All three drive the same tools, so clinic state stays consistent whichever engine answers."""
+    global _BEDROCK_DOWN_UNTIL, _AZURE_DOWN_UNTIL
+    if time.time() >= _BEDROCK_DOWN_UNTIL:
+        try:
+            r = _respond_llm(phone, user_text)
+            LAST_ENGINE["name"] = f"bedrock:{MODEL_ID}"
+            return r
+        except Exception as e:
+            if e.__class__.__name__ not in ("ThrottlingException", "AccessDeniedException", "ResourceNotFoundException",
+                                            "ValidationException", "ServiceUnavailableException",
+                                            "ModelNotReadyException", "ClientError"):
+                raise
+            _BEDROCK_DOWN_UNTIL = time.time() + 600
+            c.log.warning("Bedrock unavailable (%s)", e.__class__.__name__)
+    if AZURE_ENDPOINT and AZURE_DEPLOYMENT and time.time() >= _AZURE_DOWN_UNTIL:
+        try:
+            r = _respond_azure(phone, user_text)
+            LAST_ENGINE["name"] = f"azure-openai:{AZURE_DEPLOYMENT}"
+            return r
+        except Exception:
+            _AZURE_DOWN_UNTIL = time.time() + 120
+            c.log.exception("Azure OpenAI unavailable")
+    LAST_ENGINE["name"] = "fallback-router"
+    return fallback(phone, user_text)
+
+
+def _system_and_history(phone: str):
     cl = c.clinic()
     prof = c.patient(phone)
     system = SYSTEM.format(
@@ -292,13 +399,17 @@ def _respond_llm(phone: str, user_text: str) -> str:
         today=c.today(), now=c.now_ist().strftime("%H:%M"),
         profile=json.dumps({k: prof.get(k) for k in ("name", "email", "travel_min") if prof.get(k)}) or "new patient",
     )
-    history = c.load_conv(phone)
+    return system, c.load_conv(phone)
+
+
+def _respond_llm(phone: str, user_text: str) -> str:
+    system, history = _system_and_history(phone)
     messages = [{"role": m["role"], "content": [{"text": m["text"]}]} for m in history]
     messages.append({"role": "user", "content": [{"text": user_text}]})
 
     reply = "Sorry, I had trouble there. Please try again 🙏"
     for _ in range(6):
-        out = brt.converse(modelId=MODEL_ID, system=[{"text": system}], messages=messages,
+        out = _bedrock().converse(modelId=MODEL_ID, system=[{"text": system}], messages=messages,
                            toolConfig=TOOL_CONFIG, inferenceConfig={"maxTokens": 600, "temperature": 0.3})
         msg = out["output"]["message"]
         messages.append(msg)
