@@ -113,32 +113,84 @@ def email(to: str, subject: str, text: str, html: str | None = None) -> bool:
 
 # ---------------------------------------------------------------- Data model
 # Single table, pk/sk:
-#   CLINIC#<id>                 META                 name, avg_consult_min, address, hours
-#   CLINIC#<id>#DAY#<date>      COUNTER              last_token, now_serving
-#   CLINIC#<id>#DAY#<date>      TOKEN#<nnn>          phone, name, service, status, nudged, photos
-#   PATIENT#<phone>             PROFILE              name, email, travel_min
-#   PATIENT#<phone>             PACKAGE#<name>       total, used, interval_days, next_due
-#   PATIENT#<phone>             CONV                 turns (recent chat history)
+#   CLINIC#<id>                 META                 name, address, hours, queues{OPD,LASER}, lat, lon, doctor_email
+#   CLINIC#<id>#DAY#<date>      COUNTER#<Q>          last_token, now_serving          (Q = OPD | LASER)
+#   CLINIC#<id>#DAY#<date>      TOKEN#<Q>#<nnn>      queue, token, label, pos, phone, name, service, status,
+#                                                    nudged, photos, created/nudged_at/called_at/arrived_at/done_at
+#   CLINIC#<id>#DAY#<date>      STATS                status_checks, nudges, photos, package_bookings, late, ...
+#   PATIENT#<phone>             PROFILE              name, email, travel_min, travel_source, lat, lon
+#   PATIENT#<phone>             PACKAGE#<name>       total, used, interval_days, next_due, queue
+#   PATIENT#<phone>             CONV                 turns (recent chat history, when AgentCore Memory is off)
+QUEUES = ("OPD", "LASER")
+DEFAULT_QUEUES = {"OPD": {"label": "Doctor consultation (OPD)", "service_min": 6, "prefix": "O"},
+                  "LASER": {"label": "Laser / procedure", "service_min": 20, "prefix": "L"}}
+
+
 def clinic(cid: str = CLINIC_ID) -> dict:
     return clean(ddb.get_item(Key={"pk": f"CLINIC#{cid}", "sk": "META"}).get("Item", {}))
+
+
+def queue_cfg(q: str, cl: dict | None = None) -> dict:
+    cl = cl if cl is not None else clinic()
+    cfg = dict(DEFAULT_QUEUES.get(q, DEFAULT_QUEUES["OPD"]))
+    cfg.update((cl.get("queues") or {}).get(q, {}))
+    return cfg
+
+
+def norm_queue(q) -> str:
+    q = str(q or "OPD").upper()
+    return "LASER" if q.startswith(("L", "P")) else "OPD"   # laser / procedure -> LASER
 
 
 def day_pk(cid: str = CLINIC_ID, date: str | None = None) -> str:
     return f"CLINIC#{cid}#DAY#{date or today()}"
 
 
-def counter(cid: str = CLINIC_ID) -> dict:
-    item = ddb.get_item(Key={"pk": day_pk(cid), "sk": "COUNTER"}).get("Item")
-    return clean(item) if item else {"last_token": 0, "now_serving": 0}
+def _norm_token(t: dict) -> dict:
+    """Back-fill fields for tokens created before queues existed."""
+    t.setdefault("queue", "OPD")
+    t.setdefault("pos", t.get("token", 0))
+    t.setdefault("label", f"{DEFAULT_QUEUES[t['queue']]['prefix']}{t.get('token', 0)}")
+    return t
 
 
-def tokens(cid: str = CLINIC_ID) -> list[dict]:
+def counter(q: str = "OPD", cid: str = CLINIC_ID) -> dict:
+    item = ddb.get_item(Key={"pk": day_pk(cid), "sk": f"COUNTER#{q}"}).get("Item")
+    return clean(item) if item else {"last_token": 0, "now_serving": 0, "now_serving_label": ""}
+
+
+def tokens(cid: str = CLINIC_ID, q: str | None = None) -> list[dict]:
     r = ddb.query(KeyConditionExpression=Key("pk").eq(day_pk(cid)) & Key("sk").begins_with("TOKEN#"))
-    return sorted(clean(r["Items"]), key=lambda t: t["token"])
+    toks = [_norm_token(t) for t in clean(r["Items"])]
+    if q:
+        toks = [t for t in toks if t["queue"] == q]
+    return sorted(toks, key=lambda t: (t["queue"], t["pos"]))
 
 
-def waiting(cid: str = CLINIC_ID) -> list[dict]:
-    return [t for t in tokens(cid) if t["status"] == "waiting"]
+def waiting(cid: str = CLINIC_ID, q: str | None = None) -> list[dict]:
+    return [t for t in tokens(cid, q) if t["status"] == "waiting"]
+
+
+def set_token(t: dict, **fields):
+    """Update attributes on a token row (by its sk)."""
+    expr = "SET " + ", ".join(f"#{k} = :{k}" for k in fields)
+    ddb.update_item(Key={"pk": day_pk(), "sk": t["sk"]}, UpdateExpression=expr,
+                    ExpressionAttributeNames={f"#{k}": k for k in fields},
+                    ExpressionAttributeValues={f":{k}": (Decimal(str(v)) if isinstance(v, float) else v)
+                                               for k, v in fields.items()})
+
+
+def bump(stat: str, n: int = 1):
+    """Increment a daily impact counter (STATS row)."""
+    try:
+        ddb.update_item(Key={"pk": day_pk(), "sk": "STATS"}, UpdateExpression="ADD #s :n",
+                        ExpressionAttributeNames={"#s": stat}, ExpressionAttributeValues={":n": n})
+    except Exception:
+        log.exception("stat bump failed")
+
+
+def stats(date: str | None = None) -> dict:
+    return clean(ddb.get_item(Key={"pk": day_pk(date=date), "sk": "STATS"}).get("Item", {}))
 
 
 def patient(phone: str) -> dict:
@@ -146,7 +198,7 @@ def patient(phone: str) -> dict:
 
 
 def upsert_patient(phone: str, **fields):
-    fields = {k: v for k, v in fields.items() if v not in (None, "")}
+    fields = {k: (Decimal(str(v)) if isinstance(v, float) else v) for k, v in fields.items() if v not in (None, "")}
     if not fields:
         return
     expr = "SET " + ", ".join(f"#{k} = :{k}" for k in fields)
@@ -171,10 +223,79 @@ def active_token(phone: str, cid: str = CLINIC_ID) -> dict | None:
 
 
 def eta_minutes(tok: dict, cid: str = CLINIC_ID) -> tuple[int, int]:
-    """(people_ahead, eta_minutes) for a waiting token."""
-    avg = int(clinic(cid).get("avg_consult_min", 10))
-    ahead = [t for t in tokens(cid) if t["status"] in ("waiting", "in_consult") and t["token"] < tok["token"]]
-    return len(ahead), len(ahead) * avg
+    """(people_ahead, eta_minutes) for a token, within its own queue."""
+    q = tok.get("queue", "OPD")
+    svc = int(queue_cfg(q).get("service_min", 10))
+    ahead = [t for t in tokens(cid, q) if t["status"] in ("waiting", "in_consult")
+             and t["pos"] < tok.get("pos", tok.get("token", 0)) and t["sk"] != tok.get("sk")]
+    return len(ahead), len(ahead) * svc
+
+
+def wa_link(text: str = "status") -> str:
+    """Cross-channel deep link: opens the clinic's WhatsApp chat with text pre-filled."""
+    num = "".join(ch for ch in os.environ.get("CLINIC_WA_NUMBER", "917217811862") if ch.isdigit())
+    return f"https://wa.me/{num}?text={text.replace(' ', '%20')}"
+
+
+def iso_now() -> str:
+    return now_ist().isoformat(timespec="seconds")
+
+
+def minutes_between(a: str | None, b: str | None) -> float | None:
+    if not (a and b):
+        return None
+    try:
+        return (dt.datetime.fromisoformat(b) - dt.datetime.fromisoformat(a)).total_seconds() / 60
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- Amazon Location Service
+def travel_minutes(lat: float, lon: float, cl: dict | None = None) -> tuple[int, str]:
+    """Drive time from patient to clinic. Amazon Location Service (geo-routes) first,
+    haversine estimate at city speed as a fallback. Returns (minutes, source)."""
+    cl = cl if cl is not None else clinic()
+    clat, clon = float(cl.get("lat", 28.6460)), float(cl.get("lon", 77.3695))
+    try:
+        geo = boto3.client("geo-routes")
+        r = geo.calculate_routes(Origin=[lon, lat], Destination=[clon, clat], TravelMode="Car",
+                                 DepartNow=True, LegAdditionalFeatures=["Summary"])
+        route = r["Routes"][0]
+        secs = (route.get("Summary") or {}).get("Duration")
+        if not secs:
+            secs = sum(((l.get("VehicleLegDetails") or {}).get("Summary") or {}).get("Overview", {}).get("Duration", 0)
+                       for l in route.get("Legs", []))
+        if secs:
+            return max(1, round(secs / 60)), "amazon-location"
+    except Exception:
+        log.exception("Amazon Location route failed; using distance estimate")
+    import math
+    R = 6371.0
+    p1, p2 = math.radians(lat), math.radians(clat)
+    dphi, dl = math.radians(clat - lat), math.radians(clon - lon)
+    km = 2 * R * math.asin(math.sqrt(math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2))
+    return max(3, round(km * 1.3 / 25 * 60)), "estimate"   # 1.3x road factor, 25 km/h city traffic
+
+
+# ---------------------------------------------------------------- WhatsApp UI helpers
+def wa_list(to: str, text: str, button: str, rows: list[tuple[str, str, str]], phone_id: str | None = None):
+    """Interactive list: rows = [(id, title<=24, description<=72)]."""
+    return wa_send({
+        "to": to, "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": text[:1024]},
+            "action": {"button": button[:20], "sections": [{"title": "ClinicFlow", "rows": [
+                {"id": i, "title": t[:24], "description": d[:72]} for i, t, d in rows[:10]]}]},
+        },
+    }, phone_id)
+
+
+def wa_location_request(to: str, text: str, phone_id: str | None = None):
+    """Native WhatsApp 'Send location' button."""
+    return wa_send({"to": to, "type": "interactive", "interactive": {
+        "type": "location_request_message", "body": {"text": text[:1024]},
+        "action": {"name": "send_location"}}}, phone_id)
 
 
 MEMORY_ID = os.environ.get("MEMORY_ID", "")
