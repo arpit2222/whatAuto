@@ -397,11 +397,29 @@ toast(d.delay_min?`Delay +${d.delay_min} min sent to ${d.told.length} patient(s)
 function cmp(now,prev,pd){mbox.innerHTML=`<h3 style=margin-top:0>Progress comparison</h3><div class=cmpgrid><div><b>Previous visit (${pd})</b><img src="${prev}"></div><div><b>Today</b><img src="${now}"></div></div><p><button class=sec onclick="modal.style.display='none'">Close</button></p>`;modal.style.display='flex'}
 let REC=null;
 function rx(q,label){mbox.innerHTML=`<h3 style=margin-top:0>🎙️ Prescription for ${label}</h3><p style=color:#667;margin-top:0>Speak or type. e.g. "Adapalene 0.1% gel at night, sunscreen SPF 50 every morning, review after 4 weeks"</p>
-<textarea id=rxt></textarea><p><button id=mic onclick="mic()">🎙️ Dictate</button> <button onclick="sendrx('${q}','${label}')">📤 Send to patient on WhatsApp</button> <button class=sec onclick="modal.style.display='none'">Cancel</button></p><div id=rxout></div>`;modal.style.display='flex'}
-function mic(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return toast('Voice needs Chrome. Type instead');
-if(REC){REC.stop();REC=null;document.getElementById('mic').textContent='🎙️ Dictate';return}
-REC=new SR();REC.lang='en-IN';REC.continuous=true;REC.interimResults=false;REC.onresult=e=>{for(let i=e.resultIndex;i<e.results.length;i++)document.getElementById('rxt').value+=e.results[i][0].transcript+' '};
-REC.onend=()=>{REC=null;const b=document.getElementById('mic');if(b)b.textContent='🎙️ Dictate'};REC.start();document.getElementById('mic').textContent='⏹️ Stop'}
+<textarea id=rxt></textarea><p><button id=mic onclick="mic()">🎙️ Dictate</button> <button onclick="sendrx('${q}','${label}')">📤 Send to patient on WhatsApp</button> <button class=sec onclick="modal.style.display='none'">Cancel</button></p><div id=micst style="color:#667;font-size:13px"></div><div id=rxout></div>`;modal.style.display='flex'}
+let MR=null,CH=[],BASE='';
+function micst(t){const e=document.getElementById('micst');if(e)e.textContent=t}
+async function mic(){const b=document.getElementById('mic'),ta=document.getElementById('rxt');
+if(MR||REC){if(REC){try{REC.stop()}catch(e){}REC=null}if(MR&&MR.state!='inactive')MR.stop();b.textContent='🎙️ Dictate';return}
+BASE=ta.value?ta.value.trim()+' ':'';
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(SR){REC=new SR();REC.lang='en-IN';REC.continuous=true;REC.interimResults=false;REC.onresult=e=>{for(let i=e.resultIndex;i<e.results.length;i++)ta.value+=e.results[i][0].transcript+' '};REC.onend=()=>{REC=null};try{REC.start()}catch(e){REC=null}}
+try{const st=await navigator.mediaDevices.getUserMedia({audio:true});CH=[];
+const mt=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||'';
+MR=new MediaRecorder(st,mt?{mimeType:mt}:undefined);MR.ondataavailable=e=>{if(e.data.size)CH.push(e.data)};
+MR.onstop=()=>{st.getTracks().forEach(t=>t.stop());const blob=new Blob(CH,{type:MR.mimeType||'audio/webm'});MR=null;transcribe(blob)};MR.start();
+micst(REC?'🔴 Listening… live text from browser, Amazon Transcribe refines it when you stop':'🔴 Recording… Amazon Transcribe will convert it when you stop')}
+catch(e){MR=null;if(!REC)return toast('Microphone not available. Type instead');micst('🔴 Listening (browser speech only)')}
+b.textContent='⏹️ Stop'}
+async function transcribe(blob){const ta=document.getElementById('rxt');if(!blob.size){micst('');return}
+micst('⏳ Amazon Transcribe is converting your dictation…');
+try{const r=await fetch(`api/transcribe?key=${K}&ct=${encodeURIComponent(blob.type)}`,{method:'POST',headers:{'content-type':blob.type},body:blob});const d=await r.json();
+if(!d.ok)throw new Error(d.error||'start failed');const snap=ta.value;
+for(let i=0;i<30;i++){await new Promise(z=>setTimeout(z,2000));const p=await (await fetch(`api/transcribe?key=${K}&job=${d.job}`)).json();
+if(p.status=='done'){if(!p.text)throw new Error('empty');if(ta.value==snap){ta.value=BASE+p.text;micst('✅ Transcribed by Amazon Transcribe (en-IN). Edit if needed, then send.')}else{micst('✅ Amazon Transcribe: '+p.text)}return}
+if(p.status=='failed')throw new Error(p.error||'failed')}
+throw new Error('timeout')}catch(e){micst(ta.value.trim()?'ℹ️ Amazon Transcribe unavailable ('+e.message+'). Using browser speech text.':'⚠️ Could not transcribe ('+e.message+'). Please type the prescription.')}}
 async function sendrx(q,label){const txt=document.getElementById('rxt').value.trim();if(!txt)return toast('Write or dictate the prescription');
 document.getElementById('rxout').textContent='Formatting with AI…';
 const r=await fetch(`api/rx?key=${K}&q=${q}&t=${encodeURIComponent(label)}`,{method:'POST',body:txt});const d=await r.json();
@@ -511,6 +529,54 @@ g.innerHTML=Object.values(d.queues).map(Q=>`<div class=q>${Q.delay_min?`<div cla
 load();setInterval(load,5000);</script></body></html>"""
 
 
+_tr = None
+TR_LANG = os.environ.get("TRANSCRIBE_LANG", "en-IN")
+
+
+def transcribe_start(audio_b64: str, ctype: str) -> dict:
+    """Dictated Rx audio -> S3 -> Amazon Transcribe batch job (en-IN). Async: the browser polls."""
+    global _s3, _tr
+    import base64
+    if not c.MEDIA_BUCKET or not audio_b64:
+        return {"ok": False, "error": "no audio"}
+    ctype = (ctype or "").lower()
+    fmt = next((f for f in ("webm", "ogg", "mp4", "m4a", "wav", "mp3", "flac") if f in ctype), "webm")
+    job = f"clinicflow-rx-{int(time.time() * 1000)}"
+    key = f"rx-audio/{c.today()}/{job}.{fmt}"
+    try:
+        _s3 = _s3 or boto3.client("s3")
+        _tr = _tr or boto3.client("transcribe")
+        _s3.put_object(Bucket=c.MEDIA_BUCKET, Key=key, Body=base64.b64decode(audio_b64), ContentType=ctype or "audio/webm")
+        _tr.start_transcription_job(TranscriptionJobName=job, LanguageCode=TR_LANG, MediaFormat=fmt,
+                                    Media={"MediaFileUri": f"s3://{c.MEDIA_BUCKET}/{key}"},
+                                    OutputBucketName=c.MEDIA_BUCKET, OutputKey=f"rx-text/{job}.json")
+        c.bump("transcribe_jobs")
+        return {"ok": True, "job": job}
+    except Exception as e:
+        c.log.exception("transcribe start failed")
+        return {"ok": False, "error": str(e)[:200]}
+
+
+def transcribe_poll(job: str) -> dict:
+    global _s3, _tr
+    try:
+        _s3 = _s3 or boto3.client("s3")
+        _tr = _tr or boto3.client("transcribe")
+        j = _tr.get_transcription_job(TranscriptionJobName=job)["TranscriptionJob"]
+        st = j["TranscriptionJobStatus"]
+        if st == "COMPLETED":
+            obj = _s3.get_object(Bucket=c.MEDIA_BUCKET, Key=f"rx-text/{job}.json")
+            data = json.loads(obj["Body"].read())
+            text = " ".join(t.get("transcript", "") for t in data.get("results", {}).get("transcripts", [])).strip()
+            return {"status": "done", "text": text, "engine": "amazon-transcribe"}
+        if st == "FAILED":
+            return {"status": "failed", "error": j.get("FailureReason", "")[:200]}
+        return {"status": "working"}
+    except Exception as e:
+        c.log.exception("transcribe poll failed")
+        return {"status": "failed", "error": str(e)[:200]}
+
+
 def lambda_handler(event, context):
     if event.get("source") == "aws.events" or event.get("summary"):
         return send_summary()
@@ -522,6 +588,8 @@ def lambda_handler(event, context):
     q = c.norm_queue(qs.get("q", "OPD"))
     if path.endswith("/api/queue"):
         return _resp(200, state())
+    if path.endswith("/api/transcribe") and method == "GET":
+        return _resp(200, transcribe_poll(qs.get("job", "")))
     if path.endswith("/api/tv"):
         return _resp(200, tv_state())
     if path.endswith("/tv"):
@@ -547,6 +615,12 @@ def lambda_handler(event, context):
                 import base64
                 body = base64.b64decode(body).decode("utf-8", "ignore")
             return _resp(200, send_prescription(q, qs.get("t", ""), body))
+        if path.endswith("/api/transcribe"):
+            body = event.get("body") or ""
+            if not event.get("isBase64Encoded"):
+                import base64
+                body = base64.b64encode(body.encode("latin-1", "ignore")).decode()
+            return _resp(200, transcribe_start(body, qs.get("ct", "")))
         if path.endswith("/api/paid"):
             tok = next((t for t in c.tokens(q=q) if t["label"] == qs.get("t")), None)
             if tok:
