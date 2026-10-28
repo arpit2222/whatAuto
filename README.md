@@ -45,6 +45,9 @@ back. Everyone already uses WhatsApp; nobody wants another app.
 | **👨‍👩‍👧 Family booking**: "token for my mother" from the same phone | **📺 Waiting-room TV screen** (`/tv`): now serving + next up per queue |
 | **🕔 Laser time slots**: pick a fixed slot from a WhatsApp list; optional **UPI deposit link** to cut no-shows | **🎙️ Dictated prescription**: doctor speaks → **Amazon Transcribe** (en-IN; browser speech as instant preview + fallback) → AI formats → sent to patient on WhatsApp + email, follow-up auto-scheduled |
 | **🗂️ My visits & Rx**: patient sees past visits, last prescription, package progress and next follow-up on WhatsApp | **👤 Patient profile**: every visit saved (intake, Rx, follow-up, photos, wait, feedback, no-shows); one click shows the full timeline, packages, allergies and an **✨ AI pre-read** for the doctor; each token row shows "Visit #5 · last seen · last Rx" |
+| **🎙️ Voice-note booking**: send a Hindi/English voice note → Amazon Transcribe (auto language ID) → the agent acts on it ("🎙️ I heard: …"); recordings deleted after transcription | **🧾 Printable prescription PDF** generated in Lambda, uploaded with `PostWhatsAppMessageMedia` and sent as a WhatsApp document |
+| **🗺️ Clinic address**: map pin + one-tap Google Maps directions (also sent automatically with the leave-now nudge) | **🔒 DPDP-ready privacy**: consent before anything is stored, *stop reminders*, and *delete my data* (erases profile, visits, Rx, photos, chat) |
+| 👍 / 🎧 reactions acknowledge photos and voice notes instantly | Red-flag triage still answers emergencies *before* the consent step |
 | **📷 Photo timeline** across visits, compared side by side by the doctor | **🔁 Follow-ups + feedback**: follow-up reminders on the due date; 👍 patients get the Google review link, 👎 go privately to the manager |
 
 ---
@@ -86,13 +89,13 @@ See `docs/architecture.png` for the diagram.
 
 | Service | Role |
 |---|---|
-| **AWS End User Messaging Social (WhatsApp)** | Inbound + outbound WhatsApp: text, interactive buttons, templates, media download (`SendWhatsAppMessage`, `GetWhatsAppMessageMedia`) |
+| **AWS End User Messaging Social (WhatsApp)** | Inbound + outbound WhatsApp: text, reply buttons, lists, location requests, location pins, CTA-URL buttons, reactions, documents, templates; media in and out (`SendWhatsAppMessage`, `GetWhatsAppMessageMedia`, `PostWhatsAppMessageMedia`) |
 | **Amazon SES** (sesv2) | Booking confirmations, visit summaries, package reminders |
 | **Amazon Bedrock AgentCore Runtime** | Hosts the ClinicFlow agent; one isolated session per patient |
 | Amazon Bedrock AgentCore Memory | Implemented (`common.load_conv/save_turn`, enabled by `MEMORY_ID`); provisioning failed on our new account ("Failed to provision Vector Store"), so conversation history currently uses DynamoDB |
 | **Amazon Bedrock** (Converse API, tool use, Amazon Nova) | Primary model (pending account quota) |
 | Azure OpenAI gpt-6-astra (Microsoft Foundry) | Live model today: Responses API + function calling; key in **AWS Secrets Manager** |
-| **Amazon Transcribe** | Doctor's dictated prescriptions (batch, en-IN) from the dashboard mic; browser speech recognition is the live preview and fallback |
+| **Amazon Transcribe** | Patient WhatsApp voice notes (auto language ID: Hindi / Indian English) and the doctor's dictated prescriptions (en-IN); recordings deleted after transcription |
 | AWS Lambda | WhatsApp gateway, receptionist dashboard, reminders |
 | Amazon SNS | Event destination for inbound WhatsApp events |
 | Amazon DynamoDB | Single-table data model (clinic, daily queue, patients, packages) |
@@ -103,7 +106,7 @@ See `docs/architecture.png` for the diagram.
 
 ### Where AWS CDS is called in code
 
-* `src/common.py`: `boto3.client("socialmessaging")` → `send_whatsapp_message`, `get_whatsapp_message_media`
+* `src/common.py`: `boto3.client("socialmessaging")` → `send_whatsapp_message`, `get_whatsapp_message_media`, `post_whatsapp_message_media`
 * `src/common.py`: `boto3.client("sesv2")` → `send_email`
 * `src/whatsapp_handler.py`: SNS → WhatsApp event parsing, routing to AgentCore
 * `src/agentcore_main.py`: AgentCore Runtime entry point (`/ping`, `/invocations`)
@@ -171,6 +174,8 @@ deploy/                 CloudShell deploy scripts
 
 ## Privacy & safety
 
+* Consent before any data is stored; *stop reminders* opt-out; *delete my data* erases everything about the patient (India DPDP Act 2023 principles)
+* Voice notes and dictation audio are deleted right after transcription
 * Photos stored in a private S3 bucket (public access blocked); dashboard shows masked phone numbers
 * The agent never diagnoses or prescribes; emergencies are directed to 112 / nearest hospital
 * Least-privilege IAM roles per component
