@@ -126,6 +126,7 @@ def nudge_waiting(q: str) -> list:
             except Exception:
                 c.log.exception("nudge failed")
             c.set_token(t, nudged=True, nudged_at=c.iso_now(), nudge_travel_min=travel)
+            c.maybe_send_directions(t["phone"])
             c.bump("nudges")
             sent.append(t["label"])
         elif eta <= travel + 5 + 2 * svc and not t.get("loc_refresh_asked") and (loc_age is None or loc_age > 30):
@@ -471,7 +472,7 @@ throw new Error('timeout')}catch(e){micst(ta.value.trim()?'ℹ️ Amazon Transcr
 async function sendrx(q,label){const txt=document.getElementById('rxt').value.trim();if(!txt)return toast('Write or dictate the prescription');
 document.getElementById('rxout').textContent='Formatting with AI…';
 const r=await fetch(`api/rx?key=${K}&q=${q}&t=${encodeURIComponent(label)}`,{method:'POST',body:txt});const d=await r.json();
-document.getElementById('rxout').innerHTML=d.ok?`<div class=intake style=max-width:none;white-space:pre-wrap>${esc(d.message)}</div><p>✅ Sent to ${esc(d.name)} on WhatsApp${d.followup?' · follow-up '+d.followup:''}</p>`:'❌ '+esc(d.error||'failed');load()}
+document.getElementById('rxout').innerHTML=d.ok?`<div class=intake style=max-width:none;white-space:pre-wrap>${esc(d.message)}</div><p>✅ Sent to ${esc(d.name)} on WhatsApp${d.pdf_sent?' + 🧾 printable PDF':''}${d.followup?' · follow-up '+d.followup:''}</p>`:'❌ '+esc(d.error||'failed');load()}
 async function paid(q,l){await fetch(`api/paid?key=${K}&q=${q}&t=${encodeURIComponent(l)}`,{method:'POST'});toast('Deposit marked paid for '+l);load()}
 async function summary(){const r=await fetch('api/summary?key='+K,{method:'POST'});const d=await r.json();toast(d.sent?'Summary emailed to '+d.to:'Email not sent (check SES)')}
 async function reset(){if(!confirm("Clear today's queue (tokens, counters, stats)? Patients and packages are kept."))return;
@@ -521,6 +522,18 @@ def send_prescription(q: str, label: str, dictated: str) -> dict:
     except Exception:
         c.log.exception("rx whatsapp send failed")
         wa_ok = False
+    pdf_key, pdf_ok = None, False
+    try:   # printable PDF -> S3 -> PostWhatsAppMessageMedia -> WhatsApp document
+        vno = c.patient_history(tok["phone"], tok.get("name"), bool(tok.get("family")))["visit_count"] + 1
+        pdf_key = c.save_rx_pdf(tok["phone"], tok["label"], tok["name"], msg, vno)
+        c.wa_document(tok["phone"], pdf_key, f"Prescription-{tok['name'].split()[0]}-{c.today()}.pdf",
+                      "🧾 Your printable prescription. Show it at any pharmacy.")
+        pdf_ok = True
+        c.bump("rx_pdfs")
+    except Exception:
+        c.log.exception("rx pdf failed")
+    if pdf_key:
+        c.set_token(tok, rx_pdf=pdf_key)
     prof = c.patient(tok["phone"])
     if prof.get("email"):
         c.email(prof["email"], f"Your prescription – {cl.get('name')}", header + msg)
@@ -534,7 +547,8 @@ def send_prescription(q: str, label: str, dictated: str) -> dict:
         c.bump("followups")
     c.set_token(tok, rx_sent=True, rx_text=msg[:1500], rx_at=c.iso_now())
     c.bump("prescriptions")
-    return {"ok": True, "name": tok["name"], "message": header + msg, "followup": due, "whatsapp_sent": wa_ok}
+    return {"ok": True, "name": tok["name"], "message": header + msg, "followup": due, "whatsapp_sent": wa_ok,
+            "pdf_sent": pdf_ok}
 
 
 def tv_state() -> dict:
@@ -684,6 +698,13 @@ def transcribe_poll(job: str) -> dict:
         if st == "COMPLETED":
             obj = _s3.get_object(Bucket=c.MEDIA_BUCKET, Key=f"rx-text/{job}.json")
             data = json.loads(obj["Body"].read())
+            try:   # privacy: drop the recording + raw transcript once the text is back
+                _s3.delete_object(Bucket=c.MEDIA_BUCKET, Key=f"rx-text/{job}.json")
+                src = j.get("Media", {}).get("MediaFileUri", "").split(f"s3://{c.MEDIA_BUCKET}/", 1)[-1]
+                if src.startswith("rx-audio/"):
+                    _s3.delete_object(Bucket=c.MEDIA_BUCKET, Key=src)
+            except Exception:
+                c.log.exception("rx audio cleanup failed")
             text = " ".join(t.get("transcript", "") for t in data.get("results", {}).get("transcripts", [])).strip()
             return {"status": "done", "text": text, "engine": "amazon-transcribe"}
         if st == "FAILED":

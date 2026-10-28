@@ -450,7 +450,7 @@ def save_visit(t: dict, status: str = "done") -> dict:
         "date": date, "label": t.get("label", ""), "queue": t.get("queue", "OPD"), "status": status,
         "who": t.get("name", ""), "family": bool(t.get("family")), "service": t.get("service", ""),
         "intake": t.get("intake") or {}, "intake_summary": t.get("intake_summary", ""),
-        "rx_text": t.get("rx_text", ""), "followup_due": t.get("followup_due", ""),
+        "rx_text": t.get("rx_text", ""), "rx_pdf": t.get("rx_pdf", ""), "followup_due": t.get("followup_due", ""),
         "photos": t.get("photos", []), "package": t.get("package", ""), "slot": t.get("slot", ""),
         "urgent_reason": t.get("urgent_reason", ""), "feedback": t.get("feedback", ""),
         "wait_min": round(minutes_between(t.get("created_at"), t.get("called_at")) or 0),
@@ -548,3 +548,218 @@ def history_brief(h: dict) -> dict:
         "no_shows": h.get("no_shows", 0),
         "packages": [f"{p['name']} {p['used']}/{p['total']}" for p in h.get("packages", []) if p["used"] < p["total"]],
     }
+
+
+# ---------------------------------------------------------------- richer WhatsApp messages
+def wa_reaction(to: str, message_id: str, emoji: str = "👍", phone_id: str | None = None):
+    try:
+        wa_send({"to": to, "type": "reaction", "reaction": {"message_id": message_id, "emoji": emoji}}, phone_id)
+    except Exception:
+        log.exception("reaction failed")
+
+
+def wa_upload_media(key: str, phone_id: str | None = None) -> str:
+    """S3 object -> WhatsApp media id (AWS End User Messaging Social PostWhatsAppMessageMedia)."""
+    r = sm.post_whatsapp_message_media(originationPhoneNumberId=phone_id or PHONE_ID,
+                                       sourceS3File={"bucketName": MEDIA_BUCKET, "key": key})
+    return r["mediaId"]
+
+
+def wa_document(to: str, key: str, filename: str, caption: str = "", phone_id: str | None = None):
+    mid = wa_upload_media(key, phone_id)
+    return wa_send({"to": to, "type": "document",
+                    "document": {"id": mid, "filename": filename, "caption": caption[:1024]}}, phone_id)
+
+
+def wa_clinic_pin(to: str, cl: dict | None = None, phone_id: str | None = None):
+    cl = cl if cl is not None else clinic()
+    return wa_send({"to": to, "type": "location", "location": {
+        "latitude": str(cl.get("lat", "28.6460")), "longitude": str(cl.get("lon", "77.3695")),
+        "name": cl.get("name", "Clinic"), "address": cl.get("address", "")}}, phone_id)
+
+
+def maps_url(cl: dict | None = None) -> str:
+    cl = cl if cl is not None else clinic()
+    return f"https://www.google.com/maps/dir/?api=1&destination={cl.get('lat', '28.6460')},{cl.get('lon', '77.3695')}"
+
+
+def wa_cta(to: str, text: str, label: str, url: str, phone_id: str | None = None):
+    return wa_send({"to": to, "type": "interactive", "interactive": {
+        "type": "cta_url", "body": {"text": text[:1024]},
+        "action": {"name": "cta_url", "parameters": {"display_text": label[:20], "url": url}}}}, phone_id)
+
+
+def wa_contact_card(to: str, cl: dict | None = None, phone_id: str | None = None) -> bool:
+    cl = cl if cl is not None else clinic()
+    ph = cl.get("phone")
+    if not ph:
+        return False
+    nm = cl.get("name", "Clinic")
+    wa_send({"to": to, "type": "contacts", "contacts": [{
+        "name": {"formatted_name": nm, "first_name": nm},
+        "org": {"company": nm}, "phones": [{"phone": ph, "type": "WORK"}],
+        "addresses": [{"street": cl.get("address", ""), "type": "WORK"}]}]}, phone_id)
+    return True
+
+
+def send_clinic_location(to: str, phone_id: str | None = None, intro: str = ""):
+    """Pin + one-tap Google Maps directions (+ contact card to call, if the clinic phone is configured)."""
+    cl = clinic()
+    try:
+        wa_clinic_pin(to, cl, phone_id)
+        wa_cta(to, intro or f"📍 {cl.get('name', 'Clinic')}, {cl.get('address', '')}\nTap for turn-by-turn directions.",
+               "🗺️ Directions", maps_url(cl), phone_id)
+        wa_contact_card(to, cl, phone_id)
+    except Exception:
+        log.exception("clinic location send failed")
+
+
+# ---------------------------------------------------------------- Amazon Transcribe (voice notes)
+_tr = None
+
+
+def transcribe_s3(key: str, fmt: str = "ogg", languages: tuple = ("hi-IN", "en-IN"), wait_s: int = 75) -> dict:
+    """Batch-transcribe an S3 audio object, auto-identifying Hindi vs Indian English. Blocks until done."""
+    global _tr
+    _tr = _tr or boto3.client("transcribe")
+    job = f"clinicflow-voice-{int(time.time() * 1000)}"
+    _tr.start_transcription_job(TranscriptionJobName=job, MediaFormat=fmt,
+                                Media={"MediaFileUri": f"s3://{MEDIA_BUCKET}/{key}"},
+                                IdentifyLanguage=True, LanguageOptions=list(languages),
+                                OutputBucketName=MEDIA_BUCKET, OutputKey=f"voice-text/{job}.json")
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        time.sleep(2)
+        j = _tr.get_transcription_job(TranscriptionJobName=job)["TranscriptionJob"]
+        st = j["TranscriptionJobStatus"]
+        if st == "COMPLETED":
+            s3c = boto3.client("s3")
+            obj = s3c.get_object(Bucket=MEDIA_BUCKET, Key=f"voice-text/{job}.json")
+            data = json.loads(obj["Body"].read())
+            for k in (key, f"voice-text/{job}.json"):   # privacy: keep the text, not the recording
+                try:
+                    s3c.delete_object(Bucket=MEDIA_BUCKET, Key=k)
+                except Exception:
+                    log.exception("voice cleanup failed")
+            text = " ".join(x.get("transcript", "") for x in data.get("results", {}).get("transcripts", [])).strip()
+            return {"ok": bool(text), "text": text, "language": j.get("LanguageCode", ""), "secs": round(time.time() - t0)}
+        if st == "FAILED":
+            return {"ok": False, "error": j.get("FailureReason", "")}
+    return {"ok": False, "error": "timeout"}
+
+
+# ---------------------------------------------------------------- printable prescription PDF (no dependencies)
+def _pdf_txt(s: str) -> str:
+    import re as _re
+    s = _re.sub(r"[*_`]", "", s or "")
+    s = s.replace("•", "-").replace("–", "-").replace("—", "-").replace("’", "'").replace("“", '"').replace("”", '"').replace("…", "...")
+    s = s.encode("latin-1", "ignore").decode("latin-1").strip()
+    return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def make_rx_pdf(cl: dict, patient_name: str, label: str, date_str: str, rx_text: str, visit_no: int | None = None) -> bytes:
+    """A clean one-page A4 prescription. Latin text only (standard PDF fonts); the WhatsApp text keeps Hindi."""
+    import textwrap
+    ops = []
+    def text(x, y, s, size=11, bold=False, color=(0.1, 0.13, 0.11)):
+        ops.append(f"BT {color[0]} {color[1]} {color[2]} rg /F{2 if bold else 1} {size} Tf {x} {y} Td ({s}) Tj ET")
+    ops.append("0.06 0.32 0.2 rg 0 762 595 80 re f")                         # green header band
+    text(40, 808, _pdf_txt(cl.get("name", "Clinic")), 20, True, (1, 1, 1))
+    text(40, 788, _pdf_txt(cl.get("address", "")), 10, False, (0.9, 0.95, 0.92))
+    text(40, 772, _pdf_txt(cl.get("hours", ""))[:90], 9, False, (0.85, 0.92, 0.88))
+    text(40, 735, f"Patient: {_pdf_txt(patient_name)}", 12, True)
+    text(330, 735, f"Date: {_pdf_txt(date_str)}", 11)
+    text(40, 717, f"Token: {_pdf_txt(label)}" + (f"    Visit #{visit_no}" if visit_no else ""), 10, False, (0.35, 0.42, 0.38))
+    ops.append("0.8 0.85 0.82 RG 1 w 40 705 m 555 705 l S")
+    text(40, 672, "Rx", 28, True, (0.06, 0.32, 0.2))
+    y = 645
+    for raw in (rx_text or "").splitlines():
+        ln = _pdf_txt(raw)
+        if ln and not any(ch.isalnum() for ch in ln):   # e.g. a Hindi-only line (kept in the WhatsApp text)
+            continue
+        if not ln or ln.lower().replace("\\", "") in ("prescription",):
+            if not ln:
+                y -= 6
+            continue
+        head = raw.strip().startswith("*") and raw.strip().endswith("*")
+        for part in textwrap.wrap(ln, 88) or [""]:
+            if y < 90:
+                break
+            text(48, y, part, 12 if head else 11, head)
+            y -= 17
+    ops.append("0.8 0.85 0.82 RG 40 70 m 555 70 l S")
+    text(40, 52, "As advised by your doctor. Call the clinic if you have side effects.", 9, False, (0.35, 0.42, 0.38))
+    text(40, 38, "Sent via ClinicFlow on WhatsApp. Digitally generated; valid with the clinic's records.", 8, False, (0.5, 0.55, 0.52))
+    stream = "\n".join(ops).encode("latin-1")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"]
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offs = []
+    for i, o in enumerate(objs, 1):
+        offs.append(len(out))
+        out += f"{i} 0 obj\n".encode() + o + b"\nendobj\n"
+    x = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for o in offs:
+        out += f"{o:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def save_rx_pdf(phone: str, label: str, patient_name: str, rx_text: str, visit_no: int | None = None) -> str:
+    cl = clinic()
+    key = f"rx-pdf/{today()}/{phone}/{label}.pdf"
+    pdf = make_rx_pdf(cl, patient_name, label, now_ist().strftime("%d %b %Y"), rx_text, visit_no)
+    boto3.client("s3").put_object(Bucket=MEDIA_BUCKET, Key=key, Body=pdf, ContentType="application/pdf")
+    return key
+
+
+# ---------------------------------------------------------------- privacy: consent, opt-out, erasure (DPDP Act 2023)
+PRIVACY_TEXT = ("🔒 *Your privacy*\n{name} uses ClinicFlow to run its WhatsApp front desk. We store your name, phone number, "
+                "visit details, photos and prescriptions you share only to manage your visits, and we never sell or share them.\n"
+                "You can stop reminders or *delete all your data* anytime: just type *delete my data*.")
+
+
+def delete_patient_data(phone: str) -> dict:
+    """Right to erasure: patient profile, visits, packages, follow-ups, chat history, photos, Rx PDFs; today's tokens anonymised."""
+    s3 = boto3.client("s3")
+    prof = patient(phone)
+    keys = [h["key"] for h in (prof.get("photo_history") or []) if h.get("key")]
+    items = clean(ddb.query(KeyConditionExpression=Key("pk").eq(f"PATIENT#{phone}"))["Items"])
+    for it in items:
+        keys += [k for k in it.get("photos", []) if isinstance(k, str)]
+        if it.get("rx_pdf"):
+            keys.append(it["rx_pdf"])
+    removed_files = 0
+    for k in set(keys):
+        try:
+            s3.delete_object(Bucket=MEDIA_BUCKET, Key=k)
+            removed_files += 1
+        except Exception:
+            log.exception("delete object failed")
+    for it in items:
+        ddb.delete_item(Key={"pk": it["pk"], "sk": it["sk"]})
+    anon = 0
+    for t in tokens():
+        if t["phone"] == phone:
+            set_token(t, status="cancelled" if t["status"] in ("waiting", "in_consult") else t["status"],
+                      name="(deleted)", phone=f"deleted-{abs(hash(phone)) % 100000}", intake={}, intake_summary="",
+                      rx_text="", photos=[])
+            anon += 1
+    bump("data_deletions")
+    return {"records": len(items), "files": removed_files, "tokens_anonymised": anon}
+
+
+def maybe_send_directions(phone: str, phone_id: str | None = None):
+    """Once a day, with the leave-now nudge: clinic pin + Google Maps directions button."""
+    try:
+        if patient(phone).get("dir_sent") == today():
+            return
+        upsert_patient(phone, dir_sent=today())
+        send_clinic_location(phone, phone_id, "🗺️ Directions to the clinic, one tap to start navigation.")
+    except Exception:
+        log.exception("directions failed")

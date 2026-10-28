@@ -27,6 +27,8 @@ def lambda_handler(event, context):
     for p in due_packages():
         phone = p["pk"].split("#", 1)[1]
         prof = c.patient(phone)
+        if prof.get("opt_out"):
+            continue
         pname = p["sk"].split("#", 1)[1]
         name = prof.get("name", "there")
         session = p["used"] + 1
@@ -62,6 +64,8 @@ def lambda_handler(event, context):
             continue
         phone = f["pk"].split("#", 1)[1]
         prof = c.patient(phone)
+        if prof.get("opt_out"):
+            continue
         try:
             c.wa_buttons(phone, f"Hi {prof.get('name', 'there')} 👋 Your follow-up with the doctor at {cl.get('name')} is due "
                                 f"(last visit: {f.get('reason', '')[:80]}). Want a token for today?",

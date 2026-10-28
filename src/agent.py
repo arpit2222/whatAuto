@@ -62,6 +62,9 @@ You help patients:
   Then call save_intake with what they said (keep their words, translate to English) and invite an optional photo.
   Skip intake if save_intake was already called for today's token.
 
+Notes: patients may send WhatsApp voice notes; you receive the Amazon Transcribe transcript as their message (it may have small
+errors, so confirm names/times if unclear). Clinic address/directions, privacy and "delete my data" are handled by the system.
+
 Rules:
 - Reply in the patient's language and script (English, Hindi or Hinglish), warm and short: max 3-4 lines, WhatsApp style, at most one emoji.
 - ALWAYS use tools for facts about tokens, queue, packages. Never invent token numbers or times. Tokens look like O7 or L2.
@@ -354,10 +357,18 @@ def _q_from(t: str) -> str:
     return "LASER" if re.search(r"laser|peel|prp|procedure|hair removal|लेज़र", t) else "OPD"
 
 
+DEVANAGARI_HINTS = {"टोकन": " token ", "लेज़र": " laser ", "लेजर": " laser ", "कैंसल": " cancel ", "रद्द": " cancel ",
+                    "स्टेटस": " status ", "कितना": " kitna ", "कब": " kab ", "पैकेज": " package ", "देर": " der ",
+                    "पहुँच": " pahunch ", "पहुंच": " pahunch ", "डॉक्टर": " doctor ", "डॉ.": " doctor ", "अपॉइंटमेंट": " appointment ",
+                    "चाहिए": " chahiye ", "प्रिस्क्रिप्शन": " prescription ", "पर्ची": " parchi ", "दवाई": " dawai "}
+
+
 def _fallback(phone: str, text: str) -> str:
     """Deterministic intent router used when Bedrock is unavailable.
     Calls the same tools as the agent, so clinic state stays consistent."""
     t = text.lower().strip()
+    for hi, en in DEVANAGARI_HINTS.items():   # Hindi voice notes arrive in Devanagari from Amazon Transcribe
+        t = t.replace(hi, en)
     prof = c.patient(phone)
     pending = prof.get("pending", "none")
     em = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)

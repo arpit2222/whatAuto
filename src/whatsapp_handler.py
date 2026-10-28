@@ -8,6 +8,7 @@ Every reply goes back with SendWhatsAppMessage, wrapped in context-aware interac
 (reply buttons when the patient holds a token, a list menu otherwise).
 """
 import json
+import re
 import os
 
 import common as c
@@ -19,7 +20,9 @@ _ac = None
 # interactive ids -> what the patient "said"
 INTENTS = {
     "m_opd": "token opd", "m_laser": "token laser", "m_status": "status", "m_pkg": "package",
-    "m_slot": "slot", "m_hist": "my history", "h_rx": "my prescription", "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
+    "m_slot": "slot", "m_hist": "my history", "h_rx": "my prescription",
+    "m_privacy": "__privacy__", "m_clinic": "__clinic__", "c_yes": "__consent_yes__", "c_no": "__consent_no__",
+    "d_ask": "delete my data", "d_yes": "__delete_yes__", "d_no": "__delete_no__", "r_stop": "stop reminders", "r_start": "start reminders", "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
     "b_status": "status", "b_late": "running late", "b_cancel": "cancel", "b_here": "I'm here",
     "b_loc": "__share_location__",
     "book_pkg": "book session", "later": "remind me later", "fu_book": "token",
@@ -34,7 +37,9 @@ MENU_ROWS = [
     ("m_hist", "🗂️ My visits & Rx", "Past visits, last prescription, follow-ups"),
     ("m_slot", "🕔 Book laser slot", "Pick a fixed time for laser / procedure"),
     ("m_loc", "📍 Share my location", "Live-traffic drive time: know exactly when to leave"),
+    ("m_clinic", "🗺️ Clinic address", "Map pin and one-tap directions"),
     ("m_cancel", "Cancel my token", "Free your slot for someone else"),
+    ("m_privacy", "🔒 Privacy & my data", "Stop reminders or delete your data"),
 ]
 LOC_ASK = ("📍 Tap *Send location* below. ClinicFlow checks live traffic with Amazon Location Service "
            "and tells you the exact minute to leave, so you wait at home, not in the clinic.")
@@ -104,6 +109,7 @@ def handle_photo(pid: str, msg: dict, phone: str) -> str:
     key = f"photos/{c.today()}/{phone}/{msg['id']}.{ext}"
     c.wa_fetch_media(media["id"], key, pid)
     c.bump("photos")
+    c.wa_reaction(phone, msg["id"], "👍", pid)
     hist = c.patient(phone).get("photo_history") or []
     c.upsert_patient(phone, photo_history=(hist + [{"date": c.today(), "key": key}])[-24:])
     tok = c.active_token(phone)
@@ -199,62 +205,179 @@ def send_with_ui(phone: str, reply: str, pid: str, asked: str = ""):
         c.wa_text(phone, reply, pid)
 
 
+AUDIO_FMT = {"ogg": "ogg", "opus": "ogg", "mpeg": "mp3", "mp3": "mp3", "mp4": "mp4", "m4a": "m4a", "amr": "amr", "aac": "mp4"}
+DELETE_RE = re.compile(r"delete (all )?(my )?data|data delete|mera data|meri details|forget me|erase my|remove my data|data hata|data mita", re.I)
+CLINIC_RE = re.compile(r"\b(address|directions?|clinic (location|kaha|kahan|ka pata)|kaha(n)? (hai )?clinic|rasta|google maps?|map)\b", re.I)
+GREETING_RE = re.compile(r"^(hi+|hello|hey|namaste|hii+|start|menu)\W*$", re.I)
+
+
+def handle_voice(pid: str, msg: dict, phone: str) -> dict:
+    """WhatsApp voice note -> S3 (GetWhatsAppMessageMedia) -> Amazon Transcribe (Hindi / Indian English auto-detect)."""
+    audio = msg.get("audio") or {}
+    mime = (audio.get("mime_type") or "audio/ogg").lower()
+    fmt = next((v for k, v in AUDIO_FMT.items() if k in mime), "ogg")
+    key = f"voice/{c.today()}/{phone}/{msg['id']}.{fmt}"
+    c.wa_reaction(phone, msg["id"], "🎧", pid)
+    c.wa_fetch_media(audio["id"], key, pid)
+    r = c.transcribe_s3(key, fmt)
+    c.bump("voice_notes")
+    c.log.info("voice note transcribed: %s", {k: r.get(k) for k in ("ok", "language", "secs", "error")})
+    return r
+
+
+def privacy_menu(phone: str, pid: str):
+    cl = c.clinic()
+    opted = c.patient(phone).get("opt_out")
+    c.wa_buttons(phone, c.PRIVACY_TEXT.format(name=cl.get("name", "The clinic")) +
+                 ("\n\n🔕 Reminders are currently *off*." if opted else ""),
+                 [("d_ask", "🗑️ Delete my data"), ("r_start" if opted else "r_stop", "🔔 Start reminders" if opted else "🔕 Stop reminders")], pid)
+
+
+def consent_prompt(phone: str, pid: str):
+    cl = c.clinic()
+    c.wa_buttons(phone, f"👋 Welcome to {cl.get('name', 'the clinic')}!\n\n" + c.PRIVACY_TEXT.format(name=cl.get("name", "The clinic")) +
+                 "\n\nTap *I agree* to continue.", [("c_yes", "✅ I agree"), ("c_no", "❌ No thanks")], pid)
+
+
+def route_text(phone: str, text: str, pid: str, profile_name: str | None) -> str | None:
+    """Text (typed, tapped or spoken) -> reply. Returns None when the reply was already sent."""
+    low = text.strip().lower()
+    if low.startswith("__slot_") or low in ("slot", "laser slot", "slots", "book slot"):
+        import agent
+        return agent.fallback(phone, text)
+    if text in ("my history", "my prescription"):
+        import agent
+        rx = text == "my prescription"
+        c.bump("history_views")
+        card = agent.history_text(phone, with_rx=rx)
+        try:
+            if len(card) < 1000:
+                btns = [("m_opd", "🎟️ Book a visit")] if rx else [("h_rx", "💊 Last prescription"), ("m_opd", "🎟️ Book a visit")]
+                c.wa_buttons(phone, card, btns, pid)
+            else:
+                c.wa_text(phone, card, pid)
+            if rx:
+                v = next((v for v in c.visits(phone) if v.get("rx_pdf")), None)
+                if v:
+                    c.wa_document(phone, v["rx_pdf"], f"Prescription-{v['date']}.pdf", "🧾 Printable copy", pid)
+        except Exception:
+            c.log.exception("history card send failed")
+            c.wa_text(phone, card[:4000], pid)
+        return None
+    if text in ("__fb_good__", "__fb_ok__", "__fb_bad__"):
+        c.wa_text(phone, handle_feedback(phone, text.strip("_").split("_")[1]), pid)
+        return None
+    if text == "__privacy__":
+        privacy_menu(phone, pid)
+        return None
+    if text == "__clinic__" or CLINIC_RE.search(text):
+        c.send_clinic_location(phone, pid)
+        return None
+    if text == "__share_location__" or low in ("location", "share location", "my location", "📍"):
+        c.wa_location_request(phone, LOC_ASK, pid)
+        return None
+    if low in ("stop", "stop reminders", "unsubscribe", "reminders off"):
+        c.upsert_patient(phone, opt_out=True)
+        c.wa_text(phone, "🔕 Done. No more reminders from us. Your visits and tokens still work as usual. "
+                         "Type *start reminders* anytime to turn them back on.", pid)
+        return None
+    if low in ("start reminders", "r_start", "reminders on"):
+        c.upsert_patient(phone, opt_out=False)
+        c.wa_text(phone, "🔔 Reminders are back on. We'll remind you about follow-ups and package sessions.", pid)
+        return None
+    if DELETE_RE.search(text):
+        c.wa_buttons(phone, "🗑️ This permanently deletes your profile, visit history, prescriptions, photos and chat "
+                            "history from ClinicFlow. Today's token (if any) will be cancelled. Are you sure?",
+                     [("d_yes", "🗑️ Yes, delete all"), ("d_no", "Keep my data")], pid)
+        return None
+    if text == "__delete_yes__":
+        r = c.delete_patient_data(phone)
+        c.wa_text(phone, f"✅ Deleted. {r['records']} records and {r['files']} files were erased"
+                         f"{', today’s token cancelled' if r['tokens_anonymised'] else ''}. "
+                         "We've kept nothing that identifies you. Message us anytime if you want to come back. 🙏", pid)
+        return None
+    if text == "__delete_no__":
+        return "👍 Nothing deleted. Your data stays safe with the clinic."
+    rf = __import__("triage").handle(phone, text)
+    if rf:
+        return rf
+    if PHASE1_ECHO:
+        return f"ClinicFlow is live ✅\nYou said: {text}"
+    if profile_name and not c.patient(phone).get("wa_name"):
+        c.upsert_patient(phone, wa_name=profile_name)
+    return ask_agent(phone, text)
+
+
 def lambda_handler(event, context):
     for record in event.get("Records", []):
         for pid, profile_name, msg in iter_inbound(record):
             phone = msg["from"]
             c.wa_mark_read(msg["id"], pid)
-            text = None
+            text, heard, reply = None, None, None
             try:
                 mtype = msg.get("type")
-                if mtype in ("image", "document"):
+                tapped = text_of(msg) if mtype in ("interactive", "button") else None
+                typed = text_of(msg) if mtype == "text" else None
+                # 1) safety first: red flags are answered even before consent
+                if typed and (rf := __import__("triage").handle(phone, typed)):
+                    c.wa_text(phone, rf, pid)
+                    continue
+                # 2) consent gate (DPDP): nothing is stored until the patient agrees
+                prof = c.patient(phone)
+                if not prof.get("consent"):
+                    if tapped == "__consent_yes__":
+                        c.upsert_patient(phone, consent=c.iso_now(), consent_version="v1")
+                        c.bump("consents")
+                        pending = prof.get("pending_text")
+                        if pending:
+                            c.upsert_patient(phone, pending_text="")
+                        text = pending or "hi"
+                    elif tapped == "__consent_no__":
+                        if prof:
+                            c.delete_patient_data(phone)
+                        c.wa_text(phone, "No problem 🙏 We haven't stored anything. You're welcome to walk in to the clinic, "
+                                         "or message us anytime if you change your mind.", pid)
+                        continue
+                    else:
+                        if typed and not GREETING_RE.match(typed.strip()):
+                            c.upsert_patient(phone, pending_text=typed[:500])
+                        consent_prompt(phone, pid)
+                        continue
+                # 3) media
+                if text is None and mtype in ("image", "document"):
                     reply = handle_photo(pid, msg, phone)
                     caption = (msg.get("image") or msg.get("document") or {}).get("caption")
                     if caption:
                         rf = __import__("triage").handle(phone, caption)
                         reply += "\n" + (rf or ask_agent(phone, caption))
-                elif mtype == "location":
+                elif text is None and mtype == "location":
                     reply = _with_intake(phone, handle_location(msg, phone))
-                else:
-                    text = text_of(msg)
+                    c.maybe_send_directions(phone, pid) if "leave now" in reply.lower() else None
+                elif text is None and mtype == "audio":
+                    r = handle_voice(pid, msg, phone)
+                    if not r.get("ok"):
+                        c.wa_text(phone, "🎧 Sorry, I couldn't catch that voice note clearly. Could you try again or type it? 🙏", pid)
+                        continue
+                    text = heard = r["text"]
+                    if (rf := __import__("triage").handle(phone, text)):
+                        c.wa_text(phone, f"🎙️ _I heard:_ “{heard}”\n\n{rf}", pid)
+                        continue
+                elif text is None:
+                    text = tapped or typed
                     if not text:
-                        reply = "Sorry, I can read text, buttons, photos and locations for now 🙏"
-                    elif text.strip().lower() in ("slot", "laser slot", "slots", "book slot") or text.startswith("__slot_"):
-                        import agent
-                        reply = agent.fallback(phone, text)
-                    elif text in ("my history", "my prescription"):
-                        import agent
-                        rx = text == "my prescription"
-                        c.bump("history_views")
-                        card = agent.history_text(phone, with_rx=rx)
-                        try:
-                            if len(card) < 1000:
-                                btns = [("m_opd", "🎟️ Book a visit")] if rx else [("h_rx", "💊 Last prescription"), ("m_opd", "🎟️ Book a visit")]
-                                c.wa_buttons(phone, card, btns, pid)
-                            else:
-                                c.wa_text(phone, card, pid)
-                        except Exception:
-                            c.log.exception("history card send failed")
-                            c.wa_text(phone, card[:4000], pid)
+                        reply = "Sorry, I can read text, voice notes, buttons, photos and locations for now 🙏"
+                if reply is None and text:
+                    reply = route_text(phone, text, pid, profile_name)
+                    if reply is None:
                         continue
-                    elif text in ("__fb_good__", "__fb_ok__", "__fb_bad__"):
-                        c.wa_text(phone, handle_feedback(phone, text.strip("_").split("_")[1]), pid)
-                        continue
-                    elif text == "__share_location__" or text.strip().lower() in ("location", "share location", "my location", "📍"):
-                        c.wa_location_request(phone, LOC_ASK, pid)
-                        continue
-                    elif (rf := __import__("triage").handle(phone, text)):
-                        reply = rf
-                    elif PHASE1_ECHO:
-                        reply = f"ClinicFlow is live ✅\nYou said: {text}"
-                    else:
-                        if profile_name and not c.patient(phone).get("wa_name"):
-                            c.upsert_patient(phone, wa_name=profile_name)
-                        reply = ask_agent(phone, text)
+                    if heard:
+                        reply = f"🎙️ _I heard:_ “{heard}”\n\n{reply}"
             except Exception:
                 c.log.exception("handling failed")
                 reply = "Sorry, something went wrong on our side. Please try again in a minute 🙏"
-            if reply.strip() == "__SLOT_LIST__" or "__SLOT_LIST__" in reply:
+            if not reply:
+                continue
+            if "__SLOT_LIST__" in reply:
                 free = c.free_slots()
                 if not free:
                     c.wa_text(phone, "No laser slots left today 😕 Type *laser* to join the walk-in laser queue instead.", pid)
