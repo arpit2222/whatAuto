@@ -40,6 +40,12 @@ iam.put_role_policy(RoleName="clinicflow-lambda-role", PolicyName="clinicflow-tr
     "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Resource": "*",
     "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"]}]}))
 print("   transcribe policy attached to clinicflow-lambda-role")
+_mb = lam.get_function_configuration(FunctionName="clinicflow-whatsapp-handler")["Environment"]["Variables"].get("MEDIA_BUCKET", BUCKET)
+iam.put_role_policy(RoleName="clinicflow-lambda-role", PolicyName="clinicflow-v4-media-privacy", PolicyDocument=json.dumps({
+    "Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["social-messaging:PostWhatsAppMessageMedia"], "Resource": "*"},
+        {"Effect": "Allow", "Action": ["s3:DeleteObject", "s3:PutObject", "s3:GetObject"], "Resource": f"arn:aws:s3:::{_mb}/*"}]}))
+print("   media upload + erasure policy attached (bucket", _mb + ")")
 try:
     boto3.client("secretsmanager").describe_secret(SecretId="clinicflow/azure-openai-key")
     print("   secret clinicflow/azure-openai-key found")
@@ -91,7 +97,8 @@ for fn in ("clinicflow-whatsapp-handler", "clinicflow-dashboard", "clinicflow-re
     lam.update_function_code(FunctionName=fn, ZipFile=code)
     lam.get_waiter("function_updated_v2").wait(FunctionName=fn)
     ev_ = lam.get_function_configuration(FunctionName=fn).get("Environment", {}).get("Variables", {})
-    lam.update_function_configuration(FunctionName=fn, Environment={"Variables": {**ev_, **AZ}})
+    extra = {"Timeout": 120} if fn == "clinicflow-whatsapp-handler" else {}
+    lam.update_function_configuration(FunctionName=fn, Environment={"Variables": {**ev_, **AZ}}, **extra)
     lam.get_waiter("function_updated_v2").wait(FunctionName=fn)
     print("   updated", fn)
 
