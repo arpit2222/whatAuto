@@ -43,7 +43,7 @@ back. Everyone already uses WhatsApp; nobody wants another app.
 | **📝 Pre-visit intake**: 3 quick questions while waiting (concern, duration, meds/allergies) → card on the doctor's board | **⏳ Doctor running late**: one tap broadcasts the delay to everyone waiting and shifts every ETA |
 | **🚨 Red-flag triage** (English + Hindi): emergencies → 112 instantly; urgent symptoms jump the queue and flag the doctor | **🧠 Self-learning ETAs**: per-queue pace learned from today's real consult times |
 | **👨‍👩‍👧 Family booking**: "token for my mother" from the same phone | **📺 Waiting-room TV screen** (`/tv`): now serving + next up per queue |
-| **🕔 Laser time slots**: pick a fixed slot from a WhatsApp list; optional **UPI deposit link** to cut no-shows | **🎙️ Dictated prescription**: doctor speaks → AI formats → sent to patient on WhatsApp + email, follow-up auto-scheduled |
+| **🕔 Laser time slots**: pick a fixed slot from a WhatsApp list; optional **UPI deposit link** to cut no-shows | **🎙️ Dictated prescription**: doctor speaks → **Amazon Transcribe** (en-IN; browser speech as instant preview + fallback) → AI formats → sent to patient on WhatsApp + email, follow-up auto-scheduled |
 | **📷 Photo timeline** across visits, compared side by side by the doctor | **🔁 Follow-ups + feedback**: follow-up reminders on the due date; 👍 patients get the Google review link, 👎 go privately to the manager |
 
 ---
@@ -91,6 +91,7 @@ See `docs/architecture.png` for the diagram.
 | Amazon Bedrock AgentCore Memory | Implemented (`common.load_conv/save_turn`, enabled by `MEMORY_ID`); provisioning failed on our new account ("Failed to provision Vector Store"), so conversation history currently uses DynamoDB |
 | **Amazon Bedrock** (Converse API, tool use, Amazon Nova) | Primary model (pending account quota) |
 | Azure OpenAI gpt-6-astra (Microsoft Foundry) | Live model today: Responses API + function calling; key in **AWS Secrets Manager** |
+| **Amazon Transcribe** | Doctor's dictated prescriptions (batch, en-IN) from the dashboard mic; browser speech recognition is the live preview and fallback |
 | AWS Lambda | WhatsApp gateway, receptionist dashboard, reminders |
 | Amazon SNS | Event destination for inbound WhatsApp events |
 | Amazon DynamoDB | Single-table data model (clinic, daily queue, patients, packages) |
