@@ -14,7 +14,7 @@ Communication Developer Services, with the agent hosted on **Amazon Bedrock Agen
 | What | How |
 |---|---|
 | **WhatsApp the clinic bot** | Send `hi` to **+91 72178 11862** (display name currently shows *Secureyourhealthdata*: Meta display-name review is pending) |
-| Suggested script | `hi` → tap **Menu → Doctor consultation** → your name → tap **📍 Send location** → **🔄 Refresh wait** → send a photo → **⏰ Running late** → **📍 I'm here** → `laser` / `package` |
+| Suggested script | `hi` → **Menu → Doctor consultation** → your name → answer the 3 intake questions → **📍 Share location** → **🔄 Refresh wait** → send a photo → **⏰ Running late** → **✅ I've arrived** → **Menu → 🕔 Book laser slot** → `token for my mother` |
 | **Receptionist dashboard** | Link + key are in the Devpost submission (judges-only field), kept out of the public repo |
 | See the queue move | Press **✅ Call next** on the OPD or Laser queue: you get *"It's your turn"* on WhatsApp, and patients whose wait ≤ travel time + 5 min get *"Time to leave"* with buttons. Try **No-show**, **+ Walk-in**, **📧 Send doctor summary**. |
 
@@ -40,6 +40,11 @@ back. Everyone already uses WhatsApp; nobody wants another app.
 | Send photos: stored privately in S3, previewed by the doctor on the board | **📧 Daily doctor summary** via Amazon SES (20:30 IST, or on demand) incl. packages due |
 | Package status & one-tap booking of the next session (laser queue) | Package sessions auto-counted + next due date scheduled; daily reminders (WhatsApp template + email) |
 | Emails with a **"Check my queue on WhatsApp"** button (SES → WhatsApp handoff) | **↺ Reset today (demo)** for clean demos |
+| **📝 Pre-visit intake**: 3 quick questions while waiting (concern, duration, meds/allergies) → card on the doctor's board | **⏳ Doctor running late**: one tap broadcasts the delay to everyone waiting and shifts every ETA |
+| **🚨 Red-flag triage** (English + Hindi): emergencies → 112 instantly; urgent symptoms jump the queue and flag the doctor | **🧠 Self-learning ETAs**: per-queue pace learned from today's real consult times |
+| **👨‍👩‍👧 Family booking**: "token for my mother" from the same phone | **📺 Waiting-room TV screen** (`/tv`): now serving + next up per queue |
+| **🕔 Laser time slots**: pick a fixed slot from a WhatsApp list; optional **UPI deposit link** to cut no-shows | **🎙️ Dictated prescription**: doctor speaks → AI formats → sent to patient on WhatsApp + email, follow-up auto-scheduled |
+| **📷 Photo timeline** across visits, compared side by side by the doctor | **🔁 Follow-ups + feedback**: follow-up reminders on the due date; 👍 patients get the Google review link, 👎 go privately to the manager |
 
 ---
 
@@ -55,9 +60,10 @@ back. Everyone already uses WhatsApp; nobody wants another app.
       │                                              ▼
       │                               Amazon Bedrock AgentCore Runtime: clinicflow_agent
       │                               ├─ model chain: Bedrock (Nova) → Azure OpenAI gpt-6-astra → router
-      │                               ├─ tools: book_token(OPD|LASER) · queue_status · running_late ·
-      │                               │         im_here · cancel_token · my_packages ·
-      │                               │         book_package_session · set_travel_time · save_email
+      │                               ├─ 12 tools: book_token(OPD|LASER, family) · queue_status ·
+      │                               │   running_late · im_here · cancel_token · my_packages ·
+      │                               │   book_package_session · set_travel_time · save_intake ·
+      │                               │   laser_slots · book_laser_slot · save_email
       │                               └─ AgentCore Memory (code-ready; history in DynamoDB today)
       │                                              │
       │                       ┌──────────────────────┼─────────────────────┐
@@ -112,7 +118,7 @@ consistent and patients always get an answer. Each AgentCore response reports wh
 > **Azure OpenAI gpt-6-astra (Microsoft Foundry, Responses API + function calling)** as its live model. Our new AWS
 > partner account's Bedrock daily token quota is still pending AWS account verification. The Amazon Bedrock (Nova)
 > path is implemented first in the chain and takes over automatically once the quota is granted, with no redeploy.
-> Model chain: **Bedrock → Azure OpenAI → deterministic router**. All three drive the same 9 tools.
+> Model chain: **Bedrock → Azure OpenAI → deterministic router**. All three drive the same 12 tools.
 
 ---
 
@@ -152,7 +158,9 @@ src/
   agentcore_main.py     AgentCore Runtime HTTP entry point
   agent.py              Bedrock tool-use agent + fallback router + tools
   common.py             WhatsApp/SES/DynamoDB/AgentCore Memory helpers
-  dashboard.py          Receptionist board + "call next" + leave-now nudges
+  dashboard.py          Receptionist board, "call next", leave-now nudges, delay broadcast,
+                        dictated Rx, TV screen, metrics + doctor summary
+  triage.py             Red-flag screening (emergency → 112, urgent → priority)
   reminders.py          Daily package reminders (template + email)
 deploy/                 CloudShell deploy scripts
 ```
@@ -165,9 +173,9 @@ deploy/                 CloudShell deploy scripts
 
 ## Roadmap
 
-AgentCore Memory long-term strategies (patient preferences across visits) · AgentCore Gateway to expose
-clinic tools via MCP · multi-clinic onboarding & AWS Marketplace listing · RCS / SMS fallback after DLT
-registration · doctor-side visit notes → SES summary.
+Multi-doctor rooms · clinic-branded WhatsApp sender name (Meta display-name approval) · AgentCore Memory
+long-term strategies · AgentCore Gateway (clinic tools over MCP) · voice-note booking with Amazon Transcribe ·
+multi-clinic onboarding & AWS Marketplace listing · RCS / SMS fallback after DLT registration.
 
 ## License
 
