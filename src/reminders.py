@@ -54,4 +54,22 @@ def lambda_handler(event, context):
                 f"Hi {name},\n\nSession {session} of {p['total']} of your {pname} package is due.\n"
                 f"Reply on WhatsApp to get a token.\n\n{cl.get('name')}")
         sent.append(phone[-4:])
+    # follow-up visits due today
+    from boto3.dynamodb.conditions import Attr as A
+    fus = c.clean(c.ddb.scan(FilterExpression=A("sk").begins_with("FOLLOWUP#") & A("status").eq("pending"))["Items"])
+    for f in fus:
+        if f["due"] > c.today():
+            continue
+        phone = f["pk"].split("#", 1)[1]
+        prof = c.patient(phone)
+        try:
+            c.wa_buttons(phone, f"Hi {prof.get('name', 'there')} 👋 Your follow-up with the doctor at {cl.get('name')} is due "
+                                f"(last visit: {f.get('reason', '')[:80]}). Want a token for today?",
+                         [("fu_book", "🎟️ Book today"), ("later", "Remind later")])
+        except Exception:
+            c.log.exception("follow-up reminder failed for %s", phone)
+        c.ddb.update_item(Key={"pk": f["pk"], "sk": f["sk"]}, UpdateExpression="SET #s = :r",
+                          ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":r": "reminded"})
+        c.email(prof.get("email"), "Your follow-up visit is due", f"Your follow-up at {cl.get('name')} is due today.")
+        sent.append("fu-" + phone[-4:])
     return {"reminded": sent}

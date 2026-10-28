@@ -19,10 +19,11 @@ _ac = None
 # interactive ids -> what the patient "said"
 INTENTS = {
     "m_opd": "token opd", "m_laser": "token laser", "m_status": "status", "m_pkg": "package",
-    "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
+    "m_slot": "slot", "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
     "b_status": "status", "b_late": "running late", "b_cancel": "cancel", "b_here": "I'm here",
     "b_loc": "__share_location__",
-    "book_pkg": "book session", "later": "remind me later",
+    "book_pkg": "book session", "later": "remind me later", "fu_book": "token",
+    "fb_good": "__fb_good__", "fb_ok": "__fb_ok__", "fb_bad": "__fb_bad__",
 }
 
 MENU_ROWS = [
@@ -30,6 +31,7 @@ MENU_ROWS = [
     ("m_laser", "Laser / procedure", "Laser, peel, PRP: book today's slot"),
     ("m_status", "My wait time", "Live position and ETA"),
     ("m_pkg", "My packages", "Sessions done, next due, book next"),
+    ("m_slot", "🕔 Book laser slot", "Pick a fixed time for laser / procedure"),
     ("m_loc", "📍 Share my location", "Live-traffic drive time: know exactly when to leave"),
     ("m_cancel", "Cancel my token", "Free your slot for someone else"),
 ]
@@ -86,7 +88,10 @@ def text_of(msg: dict) -> str | None:
     if t == "interactive":
         i = msg["interactive"]
         r = i.get("button_reply") or i.get("list_reply") or {}
-        return INTENTS.get(r.get("id")) or r.get("title")
+        rid = r.get("id") or ""
+        if rid.startswith("slot_"):
+            return f"__slot_{rid[5:]}__"
+        return INTENTS.get(rid) or r.get("title")
     if t == "button":  # template quick reply
         return msg["button"].get("text")
     return None
@@ -98,6 +103,8 @@ def handle_photo(pid: str, msg: dict, phone: str) -> str:
     key = f"photos/{c.today()}/{phone}/{msg['id']}.{ext}"
     c.wa_fetch_media(media["id"], key, pid)
     c.bump("photos")
+    hist = c.patient(phone).get("photo_history") or []
+    c.upsert_patient(phone, photo_history=(hist + [{"date": c.today(), "key": key}])[-24:])
     tok = c.active_token(phone)
     if tok:
         c.ddb.update_item(Key={"pk": c.day_pk(), "sk": tok["sk"]},
@@ -129,6 +136,36 @@ def handle_location(msg: dict, phone: str) -> str:
                 f"Relax where you are. I'll re-check traffic as the queue moves and ping you when it's time to leave "
                 f"(about {max(1, eta - minutes - 5)} min from now).")
     return f"📍 Saved: you're ~{minutes} min away {how}. I'll use this to tell you exactly when to leave."
+
+
+def _with_intake(phone: str, reply: str) -> str:
+    try:
+        import agent
+        nxt = agent.intake_start(phone)
+        return reply + (f"\n\n{nxt}" if nxt else "")
+    except Exception:
+        c.log.exception("intake start failed")
+        return reply
+
+
+def handle_feedback(phone: str, kind: str) -> str:
+    from boto3.dynamodb.conditions import Key
+    done = [t for t in c.tokens() if t["phone"] == phone and t["status"] == "done"]
+    if done:
+        c.set_token(done[-1], feedback=kind, feedback_at=c.iso_now())
+    c.bump(f"fb_{kind}")
+    cl = c.clinic()
+    if kind == "good":
+        url = cl.get("google_review_url")
+        if url:
+            c.bump("reviews_requested")
+            return (f"Thank you! 😊 It would mean a lot to {cl.get('name')} if you shared that on Google, "
+                    f"it takes 20 seconds: {url}")
+        return "Thank you! 😊 We're glad it went well. See you next time."
+    if kind == "ok":
+        return "Thanks for the honest feedback 🙏 What could we do better? Just reply here."
+    return ("We're really sorry 😞 The clinic manager has been notified and will call you today. "
+            "If you'd like, tell us here what went wrong.")
 
 
 def send_with_ui(phone: str, reply: str, pid: str, asked: str = ""):
@@ -169,16 +206,25 @@ def lambda_handler(event, context):
                     reply = handle_photo(pid, msg, phone)
                     caption = (msg.get("image") or msg.get("document") or {}).get("caption")
                     if caption:
-                        reply += "\n" + ask_agent(phone, caption)
+                        rf = __import__("triage").handle(phone, caption)
+                        reply += "\n" + (rf or ask_agent(phone, caption))
                 elif mtype == "location":
-                    reply = handle_location(msg, phone)
+                    reply = _with_intake(phone, handle_location(msg, phone))
                 else:
                     text = text_of(msg)
                     if not text:
                         reply = "Sorry, I can read text, buttons, photos and locations for now 🙏"
+                    elif text.strip().lower() in ("slot", "laser slot", "slots", "book slot") or text.startswith("__slot_"):
+                        import agent
+                        reply = agent.fallback(phone, text)
+                    elif text in ("__fb_good__", "__fb_ok__", "__fb_bad__"):
+                        c.wa_text(phone, handle_feedback(phone, text.strip("_").split("_")[1]), pid)
+                        continue
                     elif text == "__share_location__" or text.strip().lower() in ("location", "share location", "my location", "📍"):
                         c.wa_location_request(phone, LOC_ASK, pid)
                         continue
+                    elif (rf := __import__("triage").handle(phone, text)):
+                        reply = rf
                     elif PHASE1_ECHO:
                         reply = f"ClinicFlow is live ✅\nYou said: {text}"
                     else:
@@ -188,5 +234,13 @@ def lambda_handler(event, context):
             except Exception:
                 c.log.exception("handling failed")
                 reply = "Sorry, something went wrong on our side. Please try again in a minute 🙏"
+            if reply.strip() == "__SLOT_LIST__" or "__SLOT_LIST__" in reply:
+                free = c.free_slots()
+                if not free:
+                    c.wa_text(phone, "No laser slots left today 😕 Type *laser* to join the walk-in laser queue instead.", pid)
+                else:
+                    c.wa_list(phone, "🕔 Pick a laser / procedure time for today:", "See slots",
+                              [(f"slot_{x}", x, "30 min · laser / procedure") for x in free], pid)
+                continue
             send_with_ui(phone, reply, pid, text or "")
     return {"ok": True}

@@ -45,16 +45,23 @@ Two queues run in parallel: OPD (doctor consultation, ~{opd} min each) and LASER
 Services: {services}.
 
 You help patients:
+- book for family members too (book_token with for_family_member=true and THEIR name), e.g. "mummy ke liye bhi token"
 - take a token for today in the right queue (book_token: queue OPD for consults/acne/skin problems, LASER for laser/peel/PRP/procedures)
 - see live position / ETA (queue_status), say they are running late (running_late) or have arrived (im_here), cancel (cancel_token)
 - check treatment packages and book the next session (my_packages, book_package_session)
+- laser/procedures can be booked at a fixed time: show free times (laser_slots) and book one (book_laser_slot); if a deposit_link is returned, share it
+
 - save travel time so we can ping them "leave now" (set_travel_time); they can also share their WhatsApp location
 - save an email for confirmations and visit summaries (save_email)
+- run a quick PRE-VISIT INTAKE for the doctor right after booking: ask ONE short question at a time
+  (1) main problem, (2) since when, (3) any cream/medicine already tried, (4) any allergies.
+  Then call save_intake with what they said (keep their words, translate to English) and invite an optional photo.
+  Skip intake if save_intake was already called for today's token.
 
 Rules:
 - Reply in the patient's language and script (English, Hindi or Hinglish), warm and short: max 3-4 lines, WhatsApp style, at most one emoji.
 - ALWAYS use tools for facts about tokens, queue, packages. Never invent token numbers or times. Tokens look like O7 or L2.
-- Ask for the patient's name before booking if you don't know it. After booking, ask how far they are (minutes) or to share location if unknown.
+- Ask for the patient's name before booking if you don't know it. After booking, ask how far they are or to share location if unknown, then do the intake.
 - You are not a doctor: no diagnosis or medicine advice. For medical questions say the doctor will review at the visit; for emergencies call 112 / go to the nearest hospital.
 - If a patient sends a photo, it is attached to their token for the doctor; acknowledge it.
 Known patient profile: {profile}"""
@@ -64,6 +71,7 @@ TOOLS = [
      "schema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Patient name"},
          "queue": {"type": "string", "enum": ["OPD", "LASER"], "description": "OPD = doctor consult, LASER = laser/procedure"},
+         "for_family_member": {"type": "boolean", "description": "true if booking for someone else (mother, child, spouse) from this phone"},
          "service": {"type": "string", "description": "Reason / service, e.g. acne consult, laser hair removal"}},
          "required": ["name"]}},
     {"name": "queue_status", "description": "Get the patient's current token, people ahead and ETA (or queue lengths if no token).",
@@ -80,6 +88,19 @@ TOOLS = [
      "schema": {"type": "object", "properties": {"package": {"type": "string"}}, "required": ["package"]}},
     {"name": "set_travel_time", "description": "Save how many minutes it takes the patient to reach the clinic.",
      "schema": {"type": "object", "properties": {"minutes": {"type": "integer"}}, "required": ["minutes"]}},
+    {"name": "save_intake", "description": "Save the pre-visit intake for today's token so the doctor sees a summary card.",
+     "schema": {"type": "object", "properties": {
+         "complaint": {"type": "string", "description": "Main problem in the patient's words, e.g. acne on cheeks"},
+         "duration": {"type": "string", "description": "Since when, e.g. 3 months"},
+         "tried": {"type": "string", "description": "Creams/medicines already tried, or 'nothing'"},
+         "allergies": {"type": "string", "description": "Known allergies, or 'none'"},
+         "notes": {"type": "string", "description": "Anything else relevant (optional)"}},
+         "required": ["complaint"]}},
+    {"name": "laser_slots", "description": "List today's free laser/procedure appointment slots (HH:MM).",
+     "schema": {"type": "object", "properties": {}}},
+    {"name": "book_laser_slot", "description": "Book a specific laser/procedure appointment slot today.",
+     "schema": {"type": "object", "properties": {"time": {"type": "string", "description": "HH:MM from laser_slots"},
+                                                 "name": {"type": "string"}}, "required": ["time"]}},
     {"name": "save_email", "description": "Save the patient's email for confirmations.",
      "schema": {"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}},
 ]
@@ -88,8 +109,14 @@ TOOL_CONFIG = {"tools": [{"toolSpec": {"name": t["name"], "description": t["desc
 
 
 # ---------------------------------------------------------------- tool impls
-def _book(phone: str, name: str, service: str = "", queue: str = "OPD", package: str | None = None) -> dict:
-    existing = c.active_token(phone)
+def _book(phone: str, name: str, service: str = "", queue: str = "OPD", package: str | None = None,
+          family: bool = False, slot: str | None = None) -> dict:
+    mine = c.active_tokens(phone)
+    existing = next((t for t in mine if (t.get("name") or "").strip().lower() == (name or "").strip().lower()), None)
+    if existing is None and mine and not family and not phone.startswith("walkin"):
+        prof_name = (c.patient(phone).get("name") or "").strip().lower()
+        if (name or "").strip().lower() in ("", "patient", prof_name):
+            existing = mine[0]
     if existing:
         ahead, eta = c.eta_minutes(existing)
         return {"already_booked": True, "token": existing["label"], "queue": existing["queue"],
@@ -105,13 +132,25 @@ def _book(phone: str, name: str, service: str = "", queue: str = "OPD", package:
     )["Attributes"]
     num = int(cnt["last_token"])
     label = f"{cfg.get('prefix', q[0])}{num}"
-    item = {"pk": c.day_pk(), "sk": f"TOKEN#{q}#{num:03d}", "queue": q, "token": num, "label": label, "pos": num,
+    # LASER runs by clock time: booked slots at their slot time, walk-ins at the time they joined
+    pos = (c.minute_of_day(slot) if slot else c.minute_of_day()) if q == "LASER" else num
+    item = {"pk": c.day_pk(), "sk": f"TOKEN#{q}#{num:03d}", "queue": q, "token": num, "label": label, "pos": pos,
             "phone": phone, "name": name, "service": service or cfg["label"], "status": "waiting", "nudged": False,
             "created": c.iso_now(), "photos": []}
     if package:
         item["package"] = package
+    if slot:
+        item["slot"] = slot
+    if mine and existing is None:          # booking for a family member from the same phone
+        item["family"] = True
     c.ddb.put_item(Item=item)
-    c.upsert_patient(phone, name=name)
+    if item.get("family"):
+        fam = c.patient(phone).get("family") or []
+        if name not in fam:
+            c.upsert_patient(phone, family=(fam + [name])[-6:])
+        c.bump("family_bookings")
+    else:
+        c.upsert_patient(phone, name=name)
     c.bump("bookings")
     ahead, eta = c.eta_minutes(item)
     prof = c.patient(phone)
@@ -136,7 +175,7 @@ def _book(phone: str, name: str, service: str = "", queue: str = "OPD", package:
 def run_tool(phone: str, name: str, args: dict) -> dict:
     if name == "book_token":
         return _book(phone, args.get("name") or c.patient(phone).get("name", "Patient"),
-                     args.get("service", ""), args.get("queue", "OPD"))
+                     args.get("service", ""), args.get("queue", "OPD"), family=bool(args.get("for_family_member")))
     if name == "queue_status":
         c.bump("status_checks")   # each one is a phone call the receptionist didn't take
         t = c.active_token(phone)
@@ -145,8 +184,14 @@ def run_tool(phone: str, name: str, args: dict) -> dict:
                                                        "now_serving": c.counter(q).get("now_serving_label", "")}
                                                    for q in c.QUEUES}}
         ahead, eta = c.eta_minutes(t)
-        return {"has_token": True, "token": t["label"], "queue": t["queue"], "status": t["status"],
-                "people_ahead": ahead, "eta_min": eta, "now_serving": c.counter(t["queue"]).get("now_serving_label", "")}
+        others = []
+        for o in c.active_tokens(phone)[1:]:
+            oa, oe = c.eta_minutes(o)
+            others.append({"token": o["label"], "name": o["name"], "queue": o["queue"], "status": o["status"],
+                           "people_ahead": oa, "eta_min": oe})
+        return {"has_token": True, "token": t["label"], "name": t["name"], "queue": t["queue"], "status": t["status"],
+                "people_ahead": ahead, "eta_min": eta, "now_serving": c.counter(t["queue"]).get("now_serving_label", ""),
+                "family_tokens": others}
     if name == "running_late":
         t = c.active_token(phone)
         if not t:
@@ -191,7 +236,89 @@ def run_tool(phone: str, name: str, args: dict) -> dict:
     if name == "save_email":
         c.upsert_patient(phone, email=args["email"].strip())
         return {"saved": True}
+    if name == "laser_slots":
+        return {"free_slots": c.free_slots()}
+    if name == "book_laser_slot":
+        tm = str(args["time"]).strip()[:5]
+        if tm not in c.free_slots(limit=50):
+            return {"booked": False, "reason": "slot not available", "free_slots": c.free_slots()}
+        try:
+            c.ddb.put_item(Item={"pk": c.day_pk(), "sk": f"SLOT#{tm}", "phone": phone, "status": "booked"},
+                           ConditionExpression="attribute_not_exists(sk)")
+        except Exception:
+            return {"booked": False, "reason": "just taken", "free_slots": c.free_slots()}
+        nm = args.get("name") or c.patient(phone).get("name") or "Patient"
+        mine = [t for t in c.active_tokens(phone) if t["queue"] == "LASER"]
+        if mine:   # move an existing laser token onto the slot
+            c.set_token(mine[0], slot=tm, pos=float(c.minute_of_day(tm)))
+            res = {"token": mine[0]["label"], "queue": "LASER"}
+        else:
+            res = _book(phone, nm, "Laser appointment", queue="LASER", slot=tm,
+                        family=bool(nm and nm.lower() != (c.patient(phone).get("name") or "").lower()))
+        cl = c.clinic()
+        dep = int(cl.get("laser_deposit", 200))
+        link = c.upi_link(dep, f"Laser slot {tm} deposit")
+        tok = next((t for t in c.active_tokens(phone) if t.get("slot") == tm or t["label"] == res.get("token")), None)
+        if tok:
+            c.set_token(tok, deposit_status="requested" if link else "none", deposit_amount=dep)
+        c.bump("slot_bookings")
+        return {"booked": True, "slot": tm, "token": res.get("token"), "arrive_by": f"{tm} (please arrive 10 min early)",
+                "deposit_link": link, "deposit_amount": dep if link else 0}
+    if name == "save_intake":
+        t = c.active_token(phone)
+        if not t:
+            return {"saved": False, "reason": "no active token"}
+        intake = {k: str(args.get(k, "")).strip()[:200] for k in ("complaint", "duration", "tried", "allergies", "notes")
+                  if str(args.get(k, "")).strip()}
+        c.set_token(t, intake=intake, intake_summary=intake_summary(intake), intake_at=c.iso_now())
+        c.bump("intakes")
+        return {"saved": True, "token": t["label"], "summary": intake_summary(intake)}
     return {"error": f"unknown tool {name}"}
+
+
+def intake_summary(i: dict) -> str:
+    parts = [i.get("complaint", "")]
+    if i.get("duration"):
+        parts.append(i["duration"])
+    if i.get("tried"):
+        parts.append("tried " + i["tried"] if not i["tried"].lower().startswith(("no", "nothing", "kuch nahi")) else "nothing tried")
+    if i.get("allergies"):
+        parts.append("allergies: " + i["allergies"])
+    if i.get("notes"):
+        parts.append(i["notes"])
+    return " · ".join(p for p in parts if p)
+
+
+INTAKE_Q = [
+    ("complaint", "📝 Quick 4 questions so the doctor is ready for you.\n1/4: What's the main problem? (e.g. acne, rash, hair fall, pigmentation)"),
+    ("duration", "2/4: Since when? (e.g. 2 weeks, 3 months)"),
+    ("tried", "3/4: Any cream or medicine already tried? (or *nothing*)"),
+    ("allergies", "4/4: Any allergies to medicines? (or *none*)"),
+]
+
+
+def intake_start(phone: str) -> str | None:
+    """Begin the deterministic intake if today's token has none yet."""
+    t = c.active_token(phone)
+    if not t or t.get("intake") or t.get("intake_skipped"):
+        return None
+    c.upsert_patient(phone, pending="intake:0", intake_draft="{}")
+    return INTAKE_Q[0][1]
+
+
+def intake_answer(phone: str, text: str, step: int) -> str:
+    prof = c.patient(phone)
+    draft = json.loads(prof.get("intake_draft") or "{}")
+    draft[INTAKE_Q[step][0]] = text.strip()[:200]
+    if step + 1 < len(INTAKE_Q):
+        c.upsert_patient(phone, pending=f"intake:{step + 1}", intake_draft=json.dumps(draft))
+        return INTAKE_Q[step + 1][1]
+    c.upsert_patient(phone, pending="none", intake_draft="{}")
+    r = run_tool(phone, "save_intake", draft)
+    if not r.get("saved"):
+        return "Thanks! Take a token first and I'll share this with the doctor."
+    return (f"Thank you 🙏 The doctor will see this before you walk in:\n_{r['summary']}_\n"
+            "📷 Optional: send a clear photo of the area.")
 
 
 # ---------------------------------------------------------------- fallback
@@ -236,12 +363,45 @@ def _fallback(phone: str, text: str) -> str:
         m = int(mins.group(1) if mins else t)
         run_tool(phone, "set_travel_time", {"minutes": m})
         c.upsert_patient(phone, pending="none")
-        return f"Got it – {m} min away. I'll ping you when it's time to leave 🚶"
+        nxt = intake_start(phone)
+        return f"Got it – {m} min away. I'll ping you when it's time to leave 🚶" + (f"\n\n{nxt}" if nxt else "")
+    if pending.startswith("intake:") and not re.search(
+            r"^(status|cancel|menu|hi|hello|token|laser|package|location|refresh)\b|running late|i.?m here|arrived", t):
+        if t in ("skip", "skip intake", "later"):
+            c.upsert_patient(phone, pending="none")
+            tok = c.active_token(phone)
+            if tok:
+                c.set_token(tok, intake_skipped=True)
+            return "No problem, skipped. The doctor will ask at the visit."
+        return intake_answer(phone, text, int(pending.split(":")[1]))
     if pending.startswith("name") and len(t) < 40 and "?" not in t and \
             not re.search(r"token|queue|status|cancel|package|menu|hi$|hello|kitna|kab|time|wait|late|here|laser|opd", t):
         c.upsert_patient(phone, name=text.strip().title(), pending="none")
         prof["name"] = text.strip().title()
         t = "token laser" if pending == "name:LASER" else "token opd"
+    fam = re.search(r"(for|ke liye|ka|ki)\s*(bhi\s*)?(my\s+)?(mother|mom|mummy|maa|mumma|papa|father|dad|son|beta|daughter|beti|wife|husband|bhai|brother|sister|behen|child|bachche|bacche|family)|"
+                    r"(mother|mom|mummy|maa|papa|father|son|beta|daughter|beti|wife|husband|bhai|brother|sister|behen|child)\s*(ke liye|ka|ki|for)", t)
+    if fam and re.search(r"token|book|appointment|chahiye|laser|opd|doctor|bhi", t):
+        q = _q_from(t)
+        c.upsert_patient(phone, pending=f"famname:{q}")
+        return "Sure 👨‍👩‍👧 What's their name? (I'll book a separate token for them)"
+    if pending.startswith("famname:") and len(t) < 40 and "?" not in t:
+        q = pending.split(":")[1]
+        c.upsert_patient(phone, pending="none")
+        r = run_tool(phone, "book_token", {"name": text.strip().title(), "queue": q, "for_family_member": True})
+        return (f"Booked ✅ Token *{r['token']}* for {text.strip().title()} ({'Laser' if r['queue'] == 'LASER' else 'OPD'}). "
+                f"{r['people_ahead']} ahead, ~{r['eta_min']} min. I'll message you on this number for them too.")
+    if re.search(r"\bslot\b|appointment time|time slot|samay", t) or t.startswith("__slot_"):
+        if t.startswith("__slot_"):
+            r = run_tool(phone, "book_laser_slot", {"time": t.replace("__slot_", "").strip("_"),
+                                                     "name": prof.get("name") or prof.get("wa_name")})
+            if not r.get("booked"):
+                return "Sorry, that slot just went. Type *slot* to see what's free."
+            msg = f"Booked ✅ Laser slot *{r['slot']}*, token {r['token']}. Please arrive 10 min early; I'll tell you when to leave."
+            if r.get("deposit_link"):
+                msg += f"\n💳 Please pay the ₹{r['deposit_amount']} slot deposit by UPI to confirm: {r['deposit_link']}"
+            return msg
+        return "__SLOT_LIST__"
     if re.search(r"cancel|रद्द", t):
         r = run_tool(phone, "cancel_token", {})
         return f"Token {r['token']} cancelled." if r["cancelled"] else "You don't have an active token today."
@@ -268,7 +428,10 @@ def _fallback(phone: str, text: str) -> str:
                     "Reply *token* (doctor) or *laser* to join.")
         state = "You're with the doctor now 🩺" if r["status"] == "in_consult" else \
             f"{r['people_ahead']} ahead of you, ~{r['eta_min']} min."
-        return f"Token {r['token']} ({'Laser' if r['queue'] == 'LASER' else 'OPD'}): {state} Now serving {r['now_serving'] or '–'}."
+        out = f"Token {r['token']} ({'Laser' if r['queue'] == 'LASER' else 'OPD'}): {state} Now serving {r['now_serving'] or '–'}."
+        for o in r.get("family_tokens", []):
+            out += f"\n👨‍👩‍👧 {o['name']}: token {o['token']}, {o['people_ahead']} ahead, ~{o['eta_min']} min."
+        return out
     if re.search(r"token|book|appointment|appoint|visit|doctor|chahiye|lena|opd|laser|peel|prp", t):
         q = _q_from(t)
         if not prof.get("name"):
@@ -281,6 +444,10 @@ def _fallback(phone: str, text: str) -> str:
         if not prof.get("travel_min"):
             c.upsert_patient(phone, pending="travel")
             msg += "\nShare your location 📍 (or type minutes, e.g. *20 min*) and I'll tell you exactly when to leave."
+        elif not r.get("already_booked"):
+            nxt = intake_start(phone)
+            if nxt:
+                msg += f"\n\n{nxt}"
         return msg
     cl = c.clinic()
     return (f"Hi{(' ' + prof['name']) if prof.get('name') else ''}! 👋 Welcome to {cl.get('name', 'the clinic')}.\n"

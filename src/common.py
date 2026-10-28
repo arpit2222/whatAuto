@@ -215,6 +215,11 @@ def packages(phone: str) -> list[dict]:
     return clean(r["Items"])
 
 
+def active_tokens(phone: str, cid: str = CLINIC_ID) -> list[dict]:
+    """All of today's active tokens booked from this phone (patient + family members)."""
+    return [t for t in tokens(cid) if t["phone"] == phone and t["status"] in ("waiting", "in_consult")]
+
+
 def active_token(phone: str, cid: str = CLINIC_ID) -> dict | None:
     for t in tokens(cid):
         if t["phone"] == phone and t["status"] in ("waiting", "in_consult"):
@@ -222,13 +227,70 @@ def active_token(phone: str, cid: str = CLINIC_ID) -> dict | None:
     return None
 
 
+def service_minutes(q: str, toks: list | None = None, cl: dict | None = None) -> tuple[int, int, int]:
+    """Self-learning consult time for a queue.
+    Returns (effective_min, configured_min, samples). Blends the configured value with the average of today's
+    completed visits (called_at -> done_at); after 4+ visits today's real pace dominates."""
+    cfg = int(queue_cfg(q, cl).get("service_min", 10))
+    toks = toks if toks is not None else tokens(q=q)
+    durs = [m for t in toks if t.get("queue") == q and t["status"] == "done"
+            and (m := minutes_between(t.get("called_at"), t.get("done_at"))) is not None and 0.5 <= m <= 90]
+    durs = durs[-8:]
+    if not durs:
+        return cfg, cfg, 0
+    learned = sum(durs) / len(durs)
+    w = min(len(durs), 4) / 4            # 1 visit -> 25% weight, 4+ -> 100%
+    eff = round(cfg * (1 - w) + learned * w)
+    return max(2, min(60, eff)), cfg, len(durs)
+
+
+def minute_of_day(hhmm: str | None = None) -> int:
+    if hhmm:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    n = now_ist()
+    return n.hour * 60 + n.minute
+
+
+def slot_times(cl: dict | None = None) -> list[str]:
+    """Laser appointment grid for today (30-min slots, 10:00-19:30 unless configured)."""
+    cl = cl if cl is not None else clinic()
+    if cl.get("laser_slots"):
+        return list(cl["laser_slots"])
+    return [f"{h:02d}:{m:02d}" for h in range(10, 20) for m in (0, 30)]
+
+
+def free_slots(limit: int = 10) -> list[str]:
+    taken = {i["sk"].split("#", 1)[1] for i in clean(ddb.query(
+        KeyConditionExpression=Key("pk").eq(day_pk()) & Key("sk").begins_with("SLOT#"))["Items"])
+        if i.get("status") != "cancelled"}
+    now = minute_of_day()
+    return [t for t in slot_times() if minute_of_day(t) >= now + 20 and t not in taken][:limit]
+
+
 def eta_minutes(tok: dict, cid: str = CLINIC_ID) -> tuple[int, int]:
-    """(people_ahead, eta_minutes) for a token, within its own queue."""
+    """(people_ahead, eta_minutes) for a token, within its own queue.
+    Uses the self-learned consult time, adds any announced doctor delay, and never
+    promises earlier than a booked laser slot."""
     q = tok.get("queue", "OPD")
-    svc = int(queue_cfg(q).get("service_min", 10))
-    ahead = [t for t in tokens(cid, q) if t["status"] in ("waiting", "in_consult")
+    toks = tokens(cid, q)
+    svc, _, _ = service_minutes(q, toks)
+    ahead = [t for t in toks if t["status"] in ("waiting", "in_consult")
              and t["pos"] < tok.get("pos", tok.get("token", 0)) and t["sk"] != tok.get("sk")]
-    return len(ahead), len(ahead) * svc
+    delay = int(counter(q, cid).get("delay_min", 0) or 0)
+    eta = len(ahead) * svc + delay
+    if tok.get("slot"):
+        eta = max(eta, minute_of_day(tok["slot"]) - minute_of_day())
+    return len(ahead), max(0, eta)
+
+
+def upi_link(amount: int, note: str, cl: dict | None = None) -> str | None:
+    cl = cl if cl is not None else clinic()
+    vpa = cl.get("upi_vpa")
+    if not vpa:
+        return None
+    from urllib.parse import quote
+    return (f"upi://pay?pa={quote(vpa)}&pn={quote(cl.get('name', 'Clinic'))}&am={amount}&cu=INR&tn={quote(note)}")
 
 
 def wa_link(text: str = "status") -> str:
