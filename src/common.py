@@ -435,3 +435,116 @@ def _load_conv_ddb(phone: str) -> list:
 def save_conv(phone: str, turns: list):
     ddb.put_item(Item={"pk": f"PATIENT#{phone}", "sk": "CONV",
                        "turns": json.dumps(turns[-12:]), "ts": Decimal(str(time.time()))})
+
+
+# ---------------------------------------------------------------- patient profile & visit history
+#   PATIENT#<phone>   VISIT#<date>#<label>   one record per finished visit (or no-show), kept forever
+def save_visit(t: dict, status: str = "done") -> dict:
+    """Snapshot a finished token into the patient's permanent visit history."""
+    phone = t.get("phone", "")
+    if not phone or str(phone).startswith("walkin"):
+        return {}
+    date = t.get("date") or today()
+    item = {
+        "pk": f"PATIENT#{phone}", "sk": f"VISIT#{date}#{t.get('label', '')}",
+        "date": date, "label": t.get("label", ""), "queue": t.get("queue", "OPD"), "status": status,
+        "who": t.get("name", ""), "family": bool(t.get("family")), "service": t.get("service", ""),
+        "intake": t.get("intake") or {}, "intake_summary": t.get("intake_summary", ""),
+        "rx_text": t.get("rx_text", ""), "followup_due": t.get("followup_due", ""),
+        "photos": t.get("photos", []), "package": t.get("package", ""), "slot": t.get("slot", ""),
+        "urgent_reason": t.get("urgent_reason", ""), "feedback": t.get("feedback", ""),
+        "wait_min": round(minutes_between(t.get("created_at"), t.get("called_at")) or 0),
+        "consult_min": round(minutes_between(t.get("called_at"), t.get("done_at") or iso_now()) or 0),
+        "saved_at": iso_now(),
+    }
+    item = {k: v for k, v in item.items() if v not in (None, "", [], {})} | {"family": item["family"]}
+    ddb.put_item(Item=item)
+    return item
+
+
+def visits(phone: str, limit: int = 60) -> list[dict]:
+    """Newest first."""
+    r = ddb.query(KeyConditionExpression=Key("pk").eq(f"PATIENT#{phone}") & Key("sk").begins_with("VISIT#"),
+                  ScanIndexForward=False, Limit=limit)
+    return clean(r["Items"])
+
+
+def followups(phone: str) -> list[dict]:
+    r = ddb.query(KeyConditionExpression=Key("pk").eq(f"PATIENT#{phone}") & Key("sk").begins_with("FOLLOWUP#"))
+    return clean(r["Items"])
+
+
+def set_visit_feedback(phone: str, kind: str):
+    for v in visits(phone, limit=3):
+        if v["date"] == today() and v.get("status") == "done":
+            ddb.update_item(Key={"pk": v["pk"], "sk": v["sk"]}, UpdateExpression="SET feedback = :f",
+                            ExpressionAttributeValues={":f": kind})
+            return
+
+
+def _first_line_rx(rx: str) -> str:
+    """'💊 Prescription\n1. Adapalene 0.1% gel at night…' -> 'Adapalene 0.1% gel at night…'"""
+    import re as _re
+    for ln in (rx or "").splitlines():
+        s = _re.sub(r"[*_💊]", "", ln).strip()
+        if s and not s.lower().startswith(("prescription", "how to use")) and "·" not in s[:40]:
+            return _re.sub(r"^\d+[.)]\s*", "", s)[:80]
+    return ""
+
+
+def patient_history(phone: str, who: str | None = None, family: bool | None = None) -> dict:
+    """Everything the clinic knows about a patient, assembled for the doctor / agent / patient.
+    `who` + `family` narrow visits to one person when several family members share a phone."""
+    prof = patient(phone)
+    allv = visits(phone)
+    if who is not None:
+        w = who.strip().lower()
+        mine = [v for v in allv if (v.get("who", "").strip().lower() == w) or (not family and not v.get("family"))]
+    else:
+        mine = allv
+    done = [v for v in mine if v.get("status") == "done"]
+    missed = [v for v in mine if v.get("status") == "no_show"]
+    pk = packages(phone)
+    fus = sorted(followups(phone), key=lambda f: f.get("due", ""))
+    upcoming = [f for f in fus if f.get("status") == "pending" and f.get("due", "") >= today()]
+    concerns, rx = [], None
+    for v in done:
+        comp = (v.get("intake") or {}).get("complaint") or (v.get("service") if v.get("queue") != "LASER" else "") or ""
+        if comp and comp.lower() not in [x.lower() for x in concerns]:
+            concerns.append(comp)
+        if not rx and v.get("rx_text"):
+            rx = {"date": v["date"], "text": v["rx_text"]}
+    allergies = next(((v.get("intake") or {}).get("allergies") for v in done
+                      if (v.get("intake") or {}).get("allergies")
+                      and not str((v.get("intake") or {}).get("allergies")).lower().startswith(("no", "none", "nahi"))), "")
+    fb = [v.get("feedback") for v in done if v.get("feedback")]
+    waits = [v["wait_min"] for v in done if v.get("wait_min")]
+    return {
+        "name": who or prof.get("name") or prof.get("wa_name") or "Patient",
+        "visit_count": len(done), "no_shows": len(missed), "returning": len(done) > 0,
+        "first_visit": done[-1]["date"] if done else None, "last_visit": done[0] if done else None,
+        "visits": mine, "concerns": concerns[:6], "allergies": allergies, "last_rx": rx,
+        "packages": [{"name": p["sk"].split("#", 1)[1], "used": int(p.get("used", 0)), "total": int(p.get("total", 0)),
+                      "next_due": p.get("next_due"), "queue": p.get("queue", "LASER")} for p in pk],
+        "followups": fus, "next_followup": upcoming[0] if upcoming else None,
+        "photo_history": prof.get("photo_history") or [],
+        "feedback": {"good": fb.count("good"), "ok": fb.count("ok"), "bad": fb.count("bad")},
+        "avg_wait_min": round(sum(waits) / len(waits)) if waits else None,
+        "family": prof.get("family") or [], "email": bool(prof.get("email")),
+    }
+
+
+def history_brief(h: dict) -> dict:
+    """Compact one-glance context for a queue row / the agent prompt."""
+    lv = h.get("last_visit") or {}
+    done = [v for v in h.get("visits", []) if v.get("status") == "done"]
+    lc = next(((v.get("intake") or {}).get("complaint") for v in done if (v.get("intake") or {}).get("complaint")), None)
+    return {
+        "visit_no": h["visit_count"] + 1, "returning": h["returning"], "since": h.get("first_visit"),
+        "last_date": lv.get("date"), "last_service": lv.get("service"),
+        "last_concern": lc or lv.get("service"),
+        "last_rx": _first_line_rx((h.get("last_rx") or {}).get("text", "")),
+        "last_rx_date": (h.get("last_rx") or {}).get("date"), "allergies": h.get("allergies"),
+        "no_shows": h.get("no_shows", 0),
+        "packages": [f"{p['name']} {p['used']}/{p['total']}" for p in h.get("packages", []) if p["used"] < p["total"]],
+    }

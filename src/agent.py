@@ -51,6 +51,10 @@ You help patients:
 - check treatment packages and book the next session (my_packages, book_package_session)
 - laser/procedures can be booked at a fixed time: show free times (laser_slots) and book one (book_laser_slot); if a deposit_link is returned, share it
 
+- see their own history at this clinic: past visits, last prescription, package progress, next follow-up (my_history)
+- RETURNING PATIENTS: the patient history below tells you their visit count, last concern and packages. Greet returning
+  patients by name ("Welcome back"), and when booking, ask if it's a follow-up for their last concern; offer the package session
+  if one is due. Never read out prescriptions unless they ask for them.
 - save travel time so we can ping them "leave now" (set_travel_time); they can also share their WhatsApp location
 - save an email for confirmations and visit summaries (save_email)
 - run a quick PRE-VISIT INTAKE for the doctor right after booking: ask ONE short question at a time
@@ -64,7 +68,8 @@ Rules:
 - Ask for the patient's name before booking if you don't know it. After booking, ask how far they are or to share location if unknown, then do the intake.
 - You are not a doctor: no diagnosis or medicine advice. For medical questions say the doctor will review at the visit; for emergencies call 112 / go to the nearest hospital.
 - If a patient sends a photo, it is attached to their token for the doctor; acknowledge it.
-Known patient profile: {profile}"""
+Known patient profile: {profile}
+Patient history at this clinic: {history}"""
 
 TOOLS = [
     {"name": "book_token", "description": "Book a token for today for this patient in the OPD or LASER queue.",
@@ -101,6 +106,8 @@ TOOLS = [
     {"name": "book_laser_slot", "description": "Book a specific laser/procedure appointment slot today.",
      "schema": {"type": "object", "properties": {"time": {"type": "string", "description": "HH:MM from laser_slots"},
                                                  "name": {"type": "string"}}, "required": ["time"]}},
+    {"name": "my_history", "description": "The patient's own history at this clinic: number of visits, past visits with concerns, last prescription text, packages progress and next follow-up.",
+     "schema": {"type": "object", "properties": {"include_prescription": {"type": "boolean", "description": "true if they asked for their last prescription"}}}},
     {"name": "save_email", "description": "Save the patient's email for confirmations.",
      "schema": {"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}},
 ]
@@ -236,6 +243,16 @@ def run_tool(phone: str, name: str, args: dict) -> dict:
     if name == "save_email":
         c.upsert_patient(phone, email=args["email"].strip())
         return {"saved": True}
+    if name == "my_history":
+        h = c.patient_history(phone)
+        c.bump("history_views")
+        out = {"visit_count": h["visit_count"], "since": h["first_visit"], "no_shows": h["no_shows"],
+               "visits": [{k: v.get(k) for k in ("date", "queue", "who", "status", "service", "intake_summary", "followup_due")}
+                          for v in h["visits"][:6]],
+               "packages": h["packages"], "next_followup": (h["next_followup"] or {}).get("due")}
+        if args.get("include_prescription") and h["last_rx"]:
+            out["last_prescription"] = h["last_rx"]
+        return out
     if name == "laser_slots":
         return {"free_slots": c.free_slots()}
     if name == "book_laser_slot":
@@ -405,6 +422,9 @@ def _fallback(phone: str, text: str) -> str:
     if re.search(r"cancel|रद्द", t):
         r = run_tool(phone, "cancel_token", {})
         return f"Token {r['token']} cancelled." if r["cancelled"] else "You don't have an active token today."
+    if re.search(r"histor|my visits?|past visit|previous visit|pichl|purani|records?|prescription|parchi|parcha|dawai|\brx\b", t):
+        c.bump("history_views")
+        return history_text(phone, with_rx=bool(re.search(r"prescription|parchi|parcha|dawai|\brx\b", t)))
     if t in ("book", "book today", "yes") and c.packages(phone):  # reply to session_reminder template
         t = "book session"
     if re.search(r"package|session|पैकेज", t):
@@ -541,8 +561,9 @@ def respond(phone: str, user_text: str) -> str:
             if e.__class__.__name__ not in ("ThrottlingException", "AccessDeniedException", "ResourceNotFoundException",
                                             "ValidationException", "ServiceUnavailableException",
                                             "ModelNotReadyException", "ClientError"):
-                raise
-            _BEDROCK_DOWN_UNTIL = time.time() + 600
+                c.log.exception("Bedrock turn failed; falling through")
+            else:
+                _BEDROCK_DOWN_UNTIL = time.time() + 600
             c.log.warning("Bedrock unavailable (%s)", e.__class__.__name__)
     if AZURE_ENDPOINT and AZURE_DEPLOYMENT and time.time() >= _AZURE_DOWN_UNTIL:
         try:
@@ -556,6 +577,50 @@ def respond(phone: str, user_text: str) -> str:
     return fallback(phone, user_text)
 
 
+def _history_line(phone: str) -> str:
+    try:
+        b = c.history_brief(c.patient_history(phone))
+        if not b["returning"]:
+            return "first-time patient (no past visits)"
+        return json.dumps({k: b[k] for k in ("visit_no", "since", "last_date", "last_service", "last_concern", "last_rx_date",
+                                             "packages", "no_shows") if b.get(k)})
+    except Exception:
+        c.log.exception("history line failed")
+        return "unknown"
+
+
+def history_text(phone: str, with_rx: bool = False) -> str:
+    """WhatsApp-friendly history card (deterministic, also used by the fallback router)."""
+    h = c.patient_history(phone)
+    cl = c.clinic()
+    if not h["visits"] and not h["packages"]:
+        return (f"You haven't visited {cl.get('name', 'the clinic')} with this number yet 🙂 "
+                "After your first visit, your visits and prescriptions will be saved here. Reply *token* to book.")
+    def d(x):
+        try:
+            return c.dt.date.fromisoformat(x).strftime("%d %b")
+        except Exception:
+            return x or "–"
+    lines = [f"🗂️ *Your visits at {cl.get('name', 'the clinic')}*"]
+    if h["visit_count"]:
+        lines[0] += f" ({h['visit_count']} since {d(h['first_visit'])})"
+    for v in h["visits"][:5]:
+        what = (v.get("intake") or {}).get("complaint") or v.get("service") or ("Laser" if v.get("queue") == "LASER" else "Consultation")
+        tag = " ❌ missed" if v.get("status") == "no_show" else (" 💊" if v.get("rx_text") else "")
+        who = f" ({v['who']})" if v.get("family") else ""
+        lines.append(f"• {d(v['date'])}: {what[:48] + ('…' if len(what) > 48 else '')}{who}{tag}")
+    for p in h["packages"]:
+        bar = "▓" * p["used"] + "░" * max(0, p["total"] - p["used"])
+        lines.append(f"📦 {p['name']}: {bar} {p['used']}/{p['total']}" + (f", next due {d(p['next_due'])}" if p["used"] < p["total"] else " ✅"))
+    if h["next_followup"]:
+        lines.append(f"🗓️ Next follow-up: {d(h['next_followup']['due'])}")
+    if with_rx and h["last_rx"]:
+        lines.append(f"\n💊 *Last prescription ({d(h['last_rx']['date'])})*\n{h['last_rx']['text'][:900]}")
+    elif h["last_rx"]:
+        lines.append("Reply *prescription* to see your last prescription again.")
+    return "\n".join(lines)
+
+
 def _system_and_history(phone: str):
     cl = c.clinic()
     prof = c.patient(phone)
@@ -565,6 +630,7 @@ def _system_and_history(phone: str):
         services=", ".join(cl.get("services", [])),
         today=c.today(), now=c.now_ist().strftime("%H:%M"),
         profile=json.dumps({k: prof.get(k) for k in ("name", "email", "travel_min") if prof.get(k)}) or "new patient",
+        history=_history_line(phone),
     )
     return system, c.load_conv(phone)
 

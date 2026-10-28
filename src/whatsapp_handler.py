@@ -19,7 +19,7 @@ _ac = None
 # interactive ids -> what the patient "said"
 INTENTS = {
     "m_opd": "token opd", "m_laser": "token laser", "m_status": "status", "m_pkg": "package",
-    "m_slot": "slot", "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
+    "m_slot": "slot", "m_hist": "my history", "h_rx": "my prescription", "m_cancel": "cancel", "m_late": "running late", "m_here": "I'm here", "m_loc": "__share_location__",
     "b_status": "status", "b_late": "running late", "b_cancel": "cancel", "b_here": "I'm here",
     "b_loc": "__share_location__",
     "book_pkg": "book session", "later": "remind me later", "fu_book": "token",
@@ -31,6 +31,7 @@ MENU_ROWS = [
     ("m_laser", "Laser / procedure", "Laser, peel, PRP: book today's slot"),
     ("m_status", "My wait time", "Live position and ETA"),
     ("m_pkg", "My packages", "Sessions done, next due, book next"),
+    ("m_hist", "🗂️ My visits & Rx", "Past visits, last prescription, follow-ups"),
     ("m_slot", "🕔 Book laser slot", "Pick a fixed time for laser / procedure"),
     ("m_loc", "📍 Share my location", "Live-traffic drive time: know exactly when to leave"),
     ("m_cancel", "Cancel my token", "Free your slot for someone else"),
@@ -153,6 +154,10 @@ def handle_feedback(phone: str, kind: str) -> str:
     done = [t for t in c.tokens() if t["phone"] == phone and t["status"] == "done"]
     if done:
         c.set_token(done[-1], feedback=kind, feedback_at=c.iso_now())
+    try:
+        c.set_visit_feedback(phone, kind)
+    except Exception:
+        c.log.exception("visit feedback failed")
     c.bump(f"fb_{kind}")
     cl = c.clinic()
     if kind == "good":
@@ -217,6 +222,21 @@ def lambda_handler(event, context):
                     elif text.strip().lower() in ("slot", "laser slot", "slots", "book slot") or text.startswith("__slot_"):
                         import agent
                         reply = agent.fallback(phone, text)
+                    elif text in ("my history", "my prescription"):
+                        import agent
+                        rx = text == "my prescription"
+                        c.bump("history_views")
+                        card = agent.history_text(phone, with_rx=rx)
+                        try:
+                            if len(card) < 1000:
+                                btns = [("m_opd", "🎟️ Book a visit")] if rx else [("h_rx", "💊 Last prescription"), ("m_opd", "🎟️ Book a visit")]
+                                c.wa_buttons(phone, card, btns, pid)
+                            else:
+                                c.wa_text(phone, card, pid)
+                        except Exception:
+                            c.log.exception("history card send failed")
+                            c.wa_text(phone, card[:4000], pid)
+                        continue
                     elif text in ("__fb_good__", "__fb_ok__", "__fb_bad__"):
                         c.wa_text(phone, handle_feedback(phone, text.strip("_").split("_")[1]), pid)
                         continue

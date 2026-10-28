@@ -50,9 +50,15 @@ def finish_current(q: str, status: str = "done", fu_days: int = 0):
     for t in c.tokens(q=q):
         if t["status"] != "in_consult":
             continue
-        c.set_token(t, status=status, done_at=c.iso_now())
+        now = c.iso_now()
+        c.set_token(t, status=status, done_at=now)
+        t = {**t, "status": status, "done_at": now}
         if status == "no_show":
             c.bump("no_shows")
+            try:
+                c.save_visit(t, "no_show")
+            except Exception:
+                c.log.exception("save_visit failed")
             if _is_wa(t["phone"]):
                 c.wa_buttons(t["phone"], f"We called token {t['label']} but couldn't find you 😕 "
                                          "Your token was marked missed. Want a new one?",
@@ -75,8 +81,13 @@ def finish_current(q: str, status: str = "done", fu_days: int = 0):
                                  "queue": q, "reason": t.get("intake_summary") or t.get("service", ""),
                                  "from_token": t["label"], "status": "pending"})
             c.set_token(t, followup_due=due)
+            t["followup_due"] = due
             c.bump("followups")
             fu_line = f"\n🗓️ The doctor wants to see you again around *{c.dt.date.fromisoformat(due).strftime('%d %b')}*. I'll remind you."
+        try:
+            c.save_visit(t, "done")
+        except Exception:
+            c.log.exception("save_visit failed")
         c.set_token(t, feedback_asked=True)
         try:
             c.wa_buttons(t["phone"], f"Thanks for visiting {cl.get('name')}, {t['name']}! 🙏{fu_line}\n\nHow was your visit today?",
@@ -241,6 +252,12 @@ def state() -> dict:
                     urls = _photo_urls([h["key"] for h in hist if h["date"] == last_date])
                     row["prev_photos"] = [{"date": last_date, "url": u} for u in urls[-2:]]
             row["photo_count"] = len(t.get("photos", []))
+            row["wa"] = _is_wa(t["phone"])
+            if row["wa"] and t["status"] in ("waiting", "in_consult"):
+                try:
+                    row["hist"] = c.history_brief(c.patient_history(t["phone"], t.get("name"), bool(t.get("family"))))
+                except Exception:
+                    c.log.exception("history brief failed")
             if t["status"] == "waiting":
                 row["people_ahead"], row["eta_min"] = c.eta_minutes(t)
                 prof = c.patient(t["phone"]) if _is_wa(t["phone"]) else {}
@@ -362,6 +379,16 @@ th{color:var(--muted);font-weight:600;font-size:12px}.waiting{color:#a15c00}.in_
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#14211c;color:#fff;padding:10px 16px;border-radius:10px;display:none}
 .top-acts button{background:#ffffff22;border:1px solid #ffffff55}
 tr.urg td{background:#fff1ee}.urgline{margin-top:4px;padding:5px 7px;background:#fde2dc;border:1px solid #f5b5a7;border-radius:7px;font-size:12px;color:#8a1c00;font-weight:600;max-width:260px}
+.hist{margin-top:4px;padding:5px 7px;background:#eef4ff;border:1px solid #c9dafc;border-radius:7px;font-size:12px;color:#1d3a75;max-width:280px}
+a.hl{display:inline-block;margin-top:4px;font-size:12px;color:#1849a9;text-decoration:none;font-weight:600}
+.hh{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start}.hh h3{margin:0}
+.hsum{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:12px 0}.hsum div{background:#f4f6f5;border-radius:10px;padding:8px 10px}.hsum b{display:block;font-size:20px}.hsum span{font-size:11px;color:var(--muted)}
+.ai{background:linear-gradient(135deg,#f3f0ff,#eef7ff);border:1px solid #d8d0fb;border-radius:10px;padding:10px 12px;white-space:pre-wrap;font-size:13px;margin:10px 0}
+.pk{margin:6px 0;font-size:13px}.bar{height:8px;background:#e6ece9;border-radius:6px;overflow:hidden;margin-top:3px}.bar i{display:block;height:100%;background:var(--g2)}
+.tl{border-left:3px solid #cfe0d7;margin:8px 0 0 6px;padding-left:14px}.tv{position:relative;margin-bottom:14px}.tv:before{content:'';position:absolute;left:-21px;top:4px;width:11px;height:11px;border-radius:50%;background:var(--g2);border:2px solid #fff}
+.tv.ns:before{background:#c0392b}.tv .d{font-weight:700;font-size:13px}.tv .m{font-size:12px;color:var(--muted)}.tv img,.strip img{height:64px;border-radius:7px;margin:3px 3px 0 0}
+.tv details{margin-top:4px;font-size:12px}.tv pre{white-space:pre-wrap;font-family:inherit;background:#f7faf8;border-radius:8px;padding:8px;margin:4px 0}
+.strip{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px}.strip div{font-size:11px;color:var(--muted);flex:none}
 .intake{margin-top:4px;padding:5px 7px;background:#fff8e6;border:1px solid #f3dfa8;border-radius:7px;font-size:12px;color:#5c4400;max-width:260px}
 </style></head><body>
 <header><div><h1 id=cn>ClinicFlow</h1><div class=sub id=dt></div></div>
@@ -382,7 +409,7 @@ qs.innerHTML=Object.entries(d.queues).map(([q,Q])=>`<div class=q><div class=qh><
 <button class=sec onclick="act('done','${q}')">Finish current</button><input id=wn_${q} placeholder="Walk-in name"><button class=sec onclick="walk('${q}')">+ Walk-in</button>
 <select id=dl_${q}><option value=15>15 min</option><option value=30 selected>30 min</option><option value=45>45 min</option><option value=60>60 min</option><option value=0>clear delay</option></select><button class=warn onclick="delay('${q}')">⏱️ Doctor delayed</button></div>
 <table><thead><tr><th>Token</th><th>Patient</th><th>Status</th><th>ETA</th><th>Signals</th><th>📷</th></tr></thead><tbody>
-${Q.tokens.length?Q.tokens.map(t=>`<tr${t.urgent&&t.status!='done'?' class=urg':''}><td><b>${t.label}</b>${t.urgent?'<br><span class="pill late">🚩</span>':''}</td><td>${esc(t.name)}<br><small>${esc(t.service)}</small><br><small style=color:#99a>${t.phone}</small>${t.family?'<span class=pill>👨‍👩‍👧 family</span>':''}${t.rx_sent?'<span class="pill ok">💊 Rx sent</span>':''}${t.slot?'<span class=pill>🕔 '+t.slot+'</span>':''}${t.deposit_status=='requested'?`<span class="pill late">💳 ₹${t.deposit_amount} due</span> <a href=# onclick="paid('${q}','${t.label}');return false" style=font-size:11px>mark paid</a>`:''}${t.deposit_status=='paid'?'<span class="pill ok">💳 paid</span>':''}${t.urgent?`<div class=urgline>🚩 Urgent: ${esc(t.urgent_reason)}</div>`:''}${t.intake_summary?`<div class=intake>📝 ${esc(t.intake_summary)}</div>`:''}</td>
+${Q.tokens.length?Q.tokens.map(t=>`<tr${t.urgent&&t.status!='done'?' class=urg':''}><td><b>${t.label}</b>${t.urgent?'<br><span class="pill late">🚩</span>':''}</td><td>${esc(t.name)}<br><small>${esc(t.service)}</small><br><small style=color:#99a>${t.phone}</small>${t.family?'<span class=pill>👨‍👩‍👧 family</span>':''}${t.rx_sent?'<span class="pill ok">💊 Rx sent</span>':''}${t.slot?'<span class=pill>🕔 '+t.slot+'</span>':''}${t.deposit_status=='requested'?`<span class="pill late">💳 ₹${t.deposit_amount} due</span> <a href=# onclick="paid('${q}','${t.label}');return false" style=font-size:11px>mark paid</a>`:''}${t.deposit_status=='paid'?'<span class="pill ok">💳 paid</span>':''}${t.urgent?`<div class=urgline>🚩 Urgent: ${esc(t.urgent_reason)}</div>`:''}${t.intake_summary?`<div class=intake>📝 ${esc(t.intake_summary)}</div>`:''}${t.hist?`<div class=hist>${t.hist.returning?`🔁 <b>Visit #${t.hist.visit_no}</b> · last seen ${esc(fmtd(t.hist.last_date))}<br>Concern: ${esc(t.hist.last_concern||'–')}${t.hist.last_rx?'<br>Last Rx: '+esc(t.hist.last_rx):''}`:'🆕 <b>First visit</b>'}${t.hist.allergies?` <span class="pill late">⚠️ ${esc(t.hist.allergies)}</span>`:''}${(t.hist.packages||[]).map(p=>`<span class=pill>📦 ${esc(p)}</span>`).join('')}${t.hist.no_shows?`<span class=pill>${t.hist.no_shows} no-show</span>`:''}</div>`:''}${t.wa?`<a href=# class=hl onclick="hist('${q}','${t.label}');return false">👤 Patient history</a>`:''}</td>
 <td class=${t.status}>${t.status.replace('_',' ')}</td><td>${t.eta_min!=null?t.eta_min+' min<br><small>'+t.people_ahead+' ahead</small>':''}</td>
 <td>${t.arrived?'<span class="pill ok">✓ arrived</span>':''}${t.nudged?'<span class=pill>🚶 nudged</span>':''}${t.late?'<span class="pill late">⏰ late</span>':''}${t.travel_min?`<span class="pill loc">${t.travel_min} min away${t.travel_source=='amazon-location'?' · live traffic'+(t.travel_age_min!=null?' · '+(t.travel_age_min<1?'just now':t.travel_age_min+'m ago'):''):''}</span>`:''}${t.loc_refresh_asked?'<span class=pill>📍 asked for location</span>':''}${t.package?'<span class=pill>📦 '+esc(t.package)+'</span>':''}${t.followup_due?'<span class=pill>🗓️ '+t.followup_due.slice(5)+'</span>':''}${t.feedback?`<span class="pill ${t.feedback=='bad'?'late':'ok'}">${{good:'😊',ok:'😐',bad:'😞 call back'}[t.feedback]}</span>`:''}</td>
 <td class=ph>${(t.photos||[]).map(u=>`<a href="${u}" target=_blank><img src="${u}"></a>`).join('')||(t.photo_count||'')}${(t.prev_photos||[]).length?`<div class=prev>prev ${t.prev_photos[0].date.slice(5)}: ${t.prev_photos.map(p=>`<a href="${p.url}" target=_blank><img src="${p.url}"></a>`).join('')}</div>`:''}${(t.photos||[]).length&&(t.prev_photos||[]).length?`<a class=cmp href="#" onclick="cmp('${t.photos[t.photos.length-1]}','${t.prev_photos[t.prev_photos.length-1].url}','${t.prev_photos[0].date}');return false">⇄ Compare</a>`:''}${t.status=='in_consult'&&t.phone!='walk-in'?`<br><button class=rxb onclick="rx('${q}','${t.label}')">🎙️ Rx</button>`:''}</td></tr>`).join(''):'<tr><td colspan=6 style="color:#99a;padding:16px">No tokens yet today</td></tr>'}
@@ -395,6 +422,27 @@ const r=await fetch(`api/walkin?key=${K}&q=${q}&name=${encodeURIComponent(n)}`,{
 async function delay(q){const m=document.getElementById('dl_'+q).value;const r=await fetch(`api/delay?key=${K}&q=${q}&min=${m}`,{method:'POST'});const d=await r.json();
 toast(d.delay_min?`Delay +${d.delay_min} min sent to ${d.told.length} patient(s)`:'Delay cleared');load()}
 function cmp(now,prev,pd){mbox.innerHTML=`<h3 style=margin-top:0>Progress comparison</h3><div class=cmpgrid><div><b>Previous visit (${pd})</b><img src="${prev}"></div><div><b>Today</b><img src="${now}"></div></div><p><button class=sec onclick="modal.style.display='none'">Close</button></p>`;modal.style.display='flex'}
+const FB={good:'😊',ok:'😐',bad:'😞'};
+function fmtd(d){if(!d)return '–';try{return new Date(d+'T00:00:00').toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}catch(e){return d}}
+async function hist(q,label){mbox.innerHTML='<p>Loading patient history…</p>';modal.style.display='flex';
+const h=await (await fetch(`api/history?key=${K}&q=${q}&t=${encodeURIComponent(label)}`)).json();
+if(!h.ok){mbox.innerHTML=`<p>${esc(h.error||'No history')}</p><button class=sec onclick="modal.style.display='none'">Close</button>`;return}
+const b=h.brief,fbs=Object.entries(h.feedback).filter(([k,v])=>v).map(([k,v])=>FB[k]+'×'+v).join(' ')||'–';
+mbox.innerHTML=`<div class=hh><div><h3>👤 ${esc(h.name)}</h3><div style="color:var(--muted);font-size:13px">${h.returning?`Returning patient · visit #${b.visit_no} today · since ${fmtd(h.first_visit)}`:'🆕 First visit to the clinic'} · today ${esc(h.today.label)} (${esc(h.today.queue)})</div>
+${h.allergies?`<span class="pill late">⚠️ Allergies: ${esc(h.allergies)}</span>`:''}${h.today.urgent_reason?`<span class="pill late">🚩 ${esc(h.today.urgent_reason)}</span>`:''}${h.family.length?`<span class=pill>👨‍👩‍👧 family on this phone: ${h.family.map(esc).join(', ')}</span>`:''}</div>
+<button class=sec onclick="modal.style.display='none'">Close</button></div>
+<div class=hsum><div><b>${h.visit_count}</b><span>past visits</span></div><div><b>${h.no_shows}</b><span>no-shows</span></div><div><b>${h.avg_wait_min??'–'}${h.avg_wait_min!=null?'<small> min</small>':''}</b><span>avg wait</span></div><div><b>${h.next_followup?fmtd(h.next_followup.due):'–'}</b><span>next follow-up</span></div><div><b style=font-size:16px>${fbs}</b><span>feedback</span></div></div>
+<div class=ai id=preread>✨ AI pre-read: preparing…</div>
+${h.today.intake_summary?`<div class=intake style=max-width:none>📝 <b>Today:</b> ${esc(h.today.intake_summary)}</div>`:''}
+${h.concerns.length?`<p style=font-size:13px><b>Concerns over time:</b> ${h.concerns.map(x=>`<span class=pill>${esc(x)}</span>`).join('')}</p>`:''}
+${h.packages.length?`<h4 style=margin-bottom:4px>📦 Treatment packages</h4>${h.packages.map(p=>`<div class=pk><b>${esc(p.name)}</b> · ${p.used}/${p.total} sessions${p.used<p.total?` · next due ${fmtd(p.next_due)}`:' · ✅ completed'}<div class=bar><i style="width:${Math.round(100*p.used/Math.max(1,p.total))}%"></i></div></div>`).join('')}`:''}
+${h.photo_timeline.length?`<h4 style=margin-bottom:4px>📷 Photo timeline</h4><div class=strip>${h.photo_timeline.map(p=>`<div>${fmtd(p.date)}<br>${p.urls.map(u=>`<a href="${u}" target=_blank><img src="${u}"></a>`).join('')}</div>`).join('')}</div>`:''}
+<h4 style=margin-bottom:4px>🗂️ Visit timeline</h4>${h.visits.length?`<div class=tl>${h.visits.map(v=>`<div class="tv${v.status=='no_show'?' ns':''}"><div class=d>${fmtd(v.date)} · ${v.queue=='LASER'?'Laser':'OPD'} ${esc(v.label||'')}${v.family?` · for ${esc(v.who)}`:''}${v.status=='no_show'?' · <span style=color:#c0392b>missed</span>':''} ${v.feedback?FB[v.feedback]||'':''}</div>
+<div class=m>${esc(v.service||'')}${v.package?' · 📦 '+esc(v.package):''}${v.wait_min?` · waited ${v.wait_min} min`:''}${v.consult_min?` · ${v.consult_min} min with doctor`:''}${v.followup_due?` · follow-up ${fmtd(v.followup_due)}`:''}</div>
+${v.intake_summary?`<div style=font-size:12px>📝 ${esc(v.intake_summary)}</div>`:''}${v.urgent_reason?`<div style="font-size:12px;color:#c0392b">🚩 ${esc(v.urgent_reason)}</div>`:''}
+${v.rx_text?`<details><summary>💊 Prescription</summary><pre>${esc(v.rx_text)}</pre></details>`:''}${(v.photo_urls||[]).map(u=>`<a href="${u}" target=_blank><img src="${u}"></a>`).join('')}</div>`).join('')}</div>`:'<p style="color:var(--muted);font-size:13px">No past visits yet. Today\'s visit will be saved here automatically when the doctor finishes it.</p>'}`;
+const pr=await (await fetch(`api/preread?key=${K}&q=${q}&t=${encodeURIComponent(label)}`,{method:'POST'})).json();
+const el=document.getElementById('preread');if(el)el.textContent=pr.ok?`✨ AI pre-read${pr.engine=='rules'?'':' (Azure OpenAI)'}\n${pr.text}`:'✨ AI pre-read unavailable'}
 let REC=null;
 function rx(q,label){mbox.innerHTML=`<h3 style=margin-top:0>🎙️ Prescription for ${label}</h3><p style=color:#667;margin-top:0>Speak or type. e.g. "Adapalene 0.1% gel at night, sunscreen SPF 50 every morning, review after 4 weeks"</p>
 <textarea id=rxt></textarea><p><button id=mic onclick="mic()">🎙️ Dictate</button> <button onclick="sendrx('${q}','${label}')">📤 Send to patient on WhatsApp</button> <button class=sec onclick="modal.style.display='none'">Cancel</button></p><div id=micst style="color:#667;font-size:13px"></div><div id=rxout></div>`;modal.style.display='flex'}
@@ -529,6 +577,75 @@ g.innerHTML=Object.values(d.queues).map(Q=>`<div class=q>${Q.delay_min?`<div cla
 load();setInterval(load,5000);</script></body></html>"""
 
 
+def _find_token(q: str, label: str) -> dict | None:
+    return next((t for t in c.tokens(q=q) if t["label"] == label), None)
+
+
+def history_view(q: str, label: str) -> dict:
+    """Full patient profile for the doctor: visits timeline, packages, follow-ups, photo timeline."""
+    tok = _find_token(q, label)
+    if not tok or not _is_wa(tok["phone"]):
+        return {"ok": False, "error": "no history for walk-ins"}
+    h = c.patient_history(tok["phone"], tok.get("name"), bool(tok.get("family")))
+    for v in h["visits"]:
+        v["photo_urls"] = _photo_urls(v.get("photos", []))
+        v.pop("pk", None)
+        v.pop("sk", None)
+    by_date = {}
+    for ph in h["photo_history"]:
+        by_date.setdefault(ph["date"], []).append(ph["key"])
+    h["photo_timeline"] = [{"date": d, "urls": _photo_urls(keys)} for d, keys in sorted(by_date.items())][-8:]
+    h.pop("photo_history", None)
+    h["today"] = {k: tok.get(k) for k in ("label", "queue", "service", "status", "intake_summary", "urgent_reason", "slot")}
+    h["brief"] = c.history_brief(h)
+    h["ok"] = True
+    return h
+
+
+PREREAD_INSTRUCTIONS = """You write a dermatologist's 20-second pre-read before a patient walks in, from the clinic's structured records.
+Output 3-4 short bullet lines starting with "• ", max 80 words total, plain text (no markdown headings).
+Cover: who (today's visit number = todays_visit_number, patient since), the course so far (past concerns, what was prescribed, any follow-up missed or feedback),
+today's concern versus last time, and watch-outs (allergies, packages due, no-shows, urgent flags).
+Use ONLY facts in the data. Never diagnose, never suggest new medicines. If it's a first visit, say so and summarise today's intake."""
+
+
+def preread(q: str, label: str) -> dict:
+    h = history_view(q, label)
+    if not h.get("ok"):
+        return h
+    slim = {"name": h["name"], "todays_visit_number": h["visit_count"] + 1, "past_visits": h["visit_count"], "first_visit": h["first_visit"], "no_shows": h["no_shows"],
+            "allergies": h["allergies"], "packages": h["packages"], "next_followup": h["next_followup"],
+            "feedback": h["feedback"], "today": h["today"],
+            "visits": [{k: v.get(k) for k in ("date", "queue", "status", "service", "intake_summary", "rx_text",
+                                               "followup_due", "feedback", "urgent_reason")} for v in h["visits"][:6]]}
+    try:
+        import agent
+        if agent.AZURE_ENDPOINT:
+            r = agent._azure_call({"model": agent.AZURE_DEPLOYMENT, "instructions": PREREAD_INSTRUCTIONS,
+                                   "input": [{"role": "user", "content": json.dumps(slim, default=str)[:12000]}],
+                                   "reasoning": {"effort": "low"}})
+            text = "".join(p_.get("text", "") for o in r.get("output", []) if o.get("type") == "message"
+                           for p_ in (o.get("content") or [])).strip()
+            if text:
+                c.bump("prereads")
+                return {"ok": True, "text": text.replace("**", ""), "engine": "azure-openai"}
+    except Exception:
+        c.log.exception("preread failed")
+    b = h["brief"]
+    lines = [f"• {'Returning patient, visit #' + str(b['visit_no']) + ' (since ' + str(b['since']) + ')' if b['returning'] else 'First visit'}."]
+    if b.get("last_date"):
+        lines.append(f"• Last visit {b['last_date']}: {b.get('last_service') or '-'}. Main concern so far: {b.get('last_concern') or '-'}.")
+    if b.get("last_rx"):
+        lines.append(f"• Last Rx ({b.get('last_rx_date')}): {b['last_rx']}.")
+    if h["today"].get("intake_summary"):
+        lines.append(f"• Today: {h['today']['intake_summary']}.")
+    watch = ([f"allergies: {b['allergies']}"] if b.get("allergies") else []) + b.get("packages", []) + \
+            ([f"{b['no_shows']} no-show(s)"] if b.get("no_shows") else [])
+    if watch:
+        lines.append("• Watch: " + ", ".join(watch) + ".")
+    return {"ok": True, "text": "\n".join(lines), "engine": "rules"}
+
+
 _tr = None
 TR_LANG = os.environ.get("TRANSCRIBE_LANG", "en-IN")
 
@@ -588,6 +705,10 @@ def lambda_handler(event, context):
     q = c.norm_queue(qs.get("q", "OPD"))
     if path.endswith("/api/queue"):
         return _resp(200, state())
+    if path.endswith("/api/history"):
+        return _resp(200, history_view(q, qs.get("t", "")))
+    if path.endswith("/api/preread"):
+        return _resp(200, preread(q, qs.get("t", "")))
     if path.endswith("/api/transcribe") and method == "GET":
         return _resp(200, transcribe_poll(qs.get("job", "")))
     if path.endswith("/api/tv"):
