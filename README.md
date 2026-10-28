@@ -44,6 +44,7 @@ back. Everyone already uses WhatsApp; nobody wants another app.
 | **🚨 Red-flag triage** (English + Hindi): emergencies → 112 instantly; urgent symptoms jump the queue and flag the doctor | **🧠 Self-learning ETAs**: per-queue pace learned from today's real consult times |
 | **👨‍👩‍👧 Family booking**: "token for my mother" from the same phone | **📺 Waiting-room TV screen** (`/tv`): now serving + next up per queue |
 | **🕔 Laser time slots**: pick a fixed slot from a WhatsApp list; optional **UPI deposit link** to cut no-shows | **🎙️ Dictated prescription**: doctor speaks → **Amazon Transcribe** (en-IN; browser speech as instant preview + fallback) → AI formats → sent to patient on WhatsApp + email, follow-up auto-scheduled |
+| **🗂️ My visits & Rx**: patient sees past visits, last prescription, package progress and next follow-up on WhatsApp | **👤 Patient profile**: every visit saved (intake, Rx, follow-up, photos, wait, feedback, no-shows); one click shows the full timeline, packages, allergies and an **✨ AI pre-read** for the doctor; each token row shows "Visit #5 · last seen · last Rx" |
 | **📷 Photo timeline** across visits, compared side by side by the doctor | **🔁 Follow-ups + feedback**: follow-up reminders on the due date; 👍 patients get the Google review link, 👎 go privately to the manager |
 
 ---
@@ -60,10 +61,10 @@ back. Everyone already uses WhatsApp; nobody wants another app.
       │                                              ▼
       │                               Amazon Bedrock AgentCore Runtime: clinicflow_agent
       │                               ├─ model chain: Bedrock (Nova) → Azure OpenAI gpt-6-astra → router
-      │                               ├─ 12 tools: book_token(OPD|LASER, family) · queue_status ·
+      │                               ├─ 13 tools: book_token(OPD|LASER, family) · queue_status ·
       │                               │   running_late · im_here · cancel_token · my_packages ·
       │                               │   book_package_session · set_travel_time · save_intake ·
-      │                               │   laser_slots · book_laser_slot · save_email
+      │                               │   laser_slots · book_laser_slot · my_history · save_email
       │                               └─ AgentCore Memory (code-ready; history in DynamoDB today)
       │                                              │
       │                       ┌──────────────────────┼─────────────────────┐
@@ -119,7 +120,7 @@ consistent and patients always get an answer. Each AgentCore response reports wh
 > **Azure OpenAI gpt-6-astra (Microsoft Foundry, Responses API + function calling)** as its live model. Our new AWS
 > partner account's Bedrock daily token quota is still pending AWS account verification. The Amazon Bedrock (Nova)
 > path is implemented first in the chain and takes over automatically once the quota is granted, with no redeploy.
-> Model chain: **Bedrock → Azure OpenAI → deterministic router**. All three drive the same 12 tools.
+> Model chain: **Bedrock → Azure OpenAI → deterministic router**. All three drive the same 13 tools.
 
 ---
 
@@ -133,6 +134,8 @@ consistent and patients always get an answer. Each AgentCore response reports wh
 | `CLINIC#<id>#DAY#<date>` | `TOKEN#<Q>#<nnn>` | queue, label (O7/L2), pos, phone, name, service, status, nudged, arrived, late, photos, package, created/nudged_at/called_at/arrived_at/done_at |
 | `PATIENT#<phone>` | `PROFILE` | name, email, travel_min, travel_source (amazon-location / patient), lat, lon |
 | `PATIENT#<phone>` | `PACKAGE#<name>` | total, used, interval_days, next_due |
+| `PATIENT#<phone>` | `VISIT#<date>#<label>` | permanent visit record: queue, who, service, intake, rx_text, follow-up, photos, wait/consult min, feedback, status (done / no_show) |
+| `PATIENT#<phone>` | `FOLLOWUP#<date>` | due, reason, status |
 
 ---
 
